@@ -1,2 +1,4 @@
 /target/
 /.git_corrupted_backup/
+__pycache__/
+*.pyc

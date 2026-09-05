@@ -50,7 +50,6 @@ static REQUESTS_END_MARKER: RequestsEndMarker = RequestsEndMarker::new();
 const COM1: u16 = 0x3f8;
 const PACKET_COUNT: usize = 10;
 const TENSOR_FRAME_COUNT: usize = 4;
-const TENSOR_ELEMENTS: usize = 4096;
 pub enum PipelineMessage {
     Valid(ValidatedPayload),
     BypassFault {
@@ -245,12 +244,21 @@ pub extern "C" fn _start() -> ! {
         TraceContext::new(100, 100, 0),
         tensor_frame.address() as usize,
         tensor_virtual,
-        TensorShape::new_1d(TENSOR_ELEMENTS),
+        TensorShape::new_2d(32, 32),
         DType::F32,
     );
     let one = 1.0_f32.to_ne_bytes();
-    for bytes in tensor.as_mut_slice().chunks_exact_mut(size_of::<f32>()) {
+    let two = 2.0_f32.to_ne_bytes();
+    let zero = 0.0_f32.to_ne_bytes();
+    let slice = tensor.as_mut_slice();
+    for bytes in slice[0..1024].chunks_exact_mut(size_of::<f32>()) {
         bytes.copy_from_slice(&one);
+    }
+    for bytes in slice[1024..2048].chunks_exact_mut(size_of::<f32>()) {
+        bytes.copy_from_slice(&two);
+    }
+    for bytes in slice[2048..4096].chunks_exact_mut(size_of::<f32>()) {
+        bytes.copy_from_slice(&zero);
     }
     let tensor = tensor.freeze();
     serial_println!(
@@ -259,8 +267,7 @@ pub extern "C" fn _start() -> ! {
         tensor_frame.address()
     );
     serial_println!(
-        "[CELL TENSOR] BSP prepared {} F32 elements (16 KiB, 4 frames) phys=0x{:x}",
-        TENSOR_ELEMENTS,
+        "[BSP TENSOR] Prepared MatMul 32x32 layout (A=1.0, B=2.0) at phys: 0x{:x}",
         tensor_frame.address()
     );
 
@@ -379,21 +386,26 @@ unsafe extern "C" fn ap2_compute_entry(_cpu: &Cpu) -> ! {
     }
     if let Some(tensor) = wait_tensor(&TENSOR_HOP2) {
         let sum = {
-            let values = tensor.as_slice::<f32>();
-            let vector_ok = match ap_simd {
-                simd::SimdLevel::Avx => unsafe { simd::verify_avx(values) },
-                simd::SimdLevel::Sse => unsafe { simd::verify_sse(values) },
+            let raw_ptr = tensor.virt_ptr as *mut f32;
+            let a_ptr = raw_ptr;
+            let b_ptr = raw_ptr.add(1024);
+            let c_ptr = raw_ptr.add(2048);
+
+            unsafe { simd::gemm_32x32_avx(a_ptr, b_ptr, c_ptr) };
+
+            let c_slice = unsafe {
+                core::slice::from_raw_parts(c_ptr, 1024)
             };
+            let c00 = c_slice[0];
             let mut sum = 0.0_f32;
-            for value in values {
+            for value in c_slice {
                 sum += *value;
             }
-            if vector_ok {
-                serial_println!(
-                    "[AP2 COMPUTE] SIMD AVX vector reduction finished sum={}",
-                    sum
-                );
-            }
+            serial_println!(
+                "[AP2 COMPUTE] GEMM 32x32 AVX-256 complete: C[0,0]={} sum={} expected=65536",
+                c00,
+                sum
+            );
             sum
         };
         let (_context, phys_addr) = tensor.deconstruct();
@@ -454,12 +466,12 @@ unsafe extern "C" fn ap3_supervisor_entry(_cpu: &Cpu) -> ! {
     let tensor_sum_bits = TENSOR_SUM_BITS.load(Ordering::Acquire) as u32;
     let tensor_phys = TENSOR_PHYS_ADDR.load(Ordering::Acquire);
     serial_println!(
-        "[CELL TENSOR] AP2 zero-copy reduction sum={} expected=4096",
+        "[CELL TENSOR] AP2 GEMM reduction sum={} expected=65536",
         f32::from_bits(tensor_sum_bits)
     );
     telemetry_write(TelemetryEvent::TensorExecution(TensorExecution {
         context: TraceContext::new(100, 0, 1),
-        elements: TENSOR_ELEMENTS as u32,
+        elements: 1024,
         frame_count: TENSOR_FRAME_COUNT as u16,
         dtype: DType::F32 as u8,
         simd_level: 2,

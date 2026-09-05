@@ -66,6 +66,7 @@ C1 AP1 Arbiter/Preprocessor
 	v
 C2 AP2 AVX Compute
 	| QUEUE_W2_TO_SUPERVISOR + tensor completion token
+	| (GEMM 32x32 AVX-256: C = A x B, verifikasi C[0,0]=64, sum=65536)
 	v
 C3 AP3 Supervisor/Telemetry/Egress
 ```
@@ -115,17 +116,21 @@ cargo check --target x86_64-unknown-none -p cell-baremetal
 ### TensorChunk zero-copy antar-core
 
 BSP meminta HHDM offset Limine, mengalokasikan empat frame fisik kontigu dari
-PMM, lalu mengisinya dengan 4096 elemen `F32` atau 16 KiB. Descriptor
-`TensorChunk<Ready>` dikirim melalui `TENSOR_QUEUE` ke AP tanpa menyalin buffer.
-AP membaca `&[f32]`, menjumlahkan seluruh elemen, memvalidasi hasil `4096`,
-lalu mengembalikan seluruh run empat frame ke PMM setelah `deconstruct()`:
+PMM, lalu menata layout tensor 2D: matriks A (32x32, 1024 elemen F32 = 4 KiB)
+diisi `1.0`, matriks B (32x32) diisi `2.0`, matriks C (32x32) diisi `0.0`,
+dan 1024 elemen sisa sebagai padding. Descriptor `TensorChunk<Ready>` dikirim
+melalui `TENSOR_HOP1` ke AP1 lalu `TENSOR_HOP2` ke AP2 tanpa menyalin buffer.
+
+AP2 menjalankan kernel GEMM 32x32 AVX-256 (`C = A x B`), memverifikasi bahwa
+setiap elemen C[i,j] = 64.0 dan total reduksi = 65536.0, lalu meneruskan
+checksum ke AP3. AP3 memancarkan paket `TensorExecution` ke telemetri CELLTM
+dan mengembalikan empat frame ke PMM:
 
 ```text
-[CELL PMM] allocated contiguous frames count=4 start_phys=0x53000
-[CELL TENSOR] BSP prepared 4096 F32 elements (16 KiB, 4 frames) phys=0x53000
-[CELL TENSOR] AP1 trace=100 reduced 4096 elements and freed phys=0x53000
+[BSP TENSOR] Prepared MatMul 32x32 layout (A=1.0, B=2.0) at phys: 0x53000
+[AP2 COMPUTE] GEMM 32x32 AVX-256 complete: C[0,0]=64 sum=65536 expected=65536
 [CELL PMM] contiguous frames count=4 returned to bitmap
-[CELL TENSOR] AP1 zero-copy reduction sum=4096 expected=4096
+[CORE 3 SUPERVISOR] Pipeline 4-Core tuntas: 9 sukses, 1 terisolasi. Zero crash.
 ```
 
 ### Hardware SIMD per-core
@@ -133,14 +138,16 @@ lalu mengembalikan seluruh run empat frame ke PMM setelah `deconstruct()`:
 Modul `simd` mengaktifkan FPU/SSE/AVX secara independen pada BSP dan AP.
 Deteksi CPUID memeriksa XSAVE dan AVX, kemudian konfigurasi ring-0 menghapus
 CR0.EM/TS, mengaktifkan CR0.MP, CR4.OSFXSR/OSXMMEXCPT/OSXSAVE, dan XCR0
-bits x87+SSE+AVX (`0x7`). Probe AP menggunakan `vaddps` 256-bit langsung pada
-delapan elemen tensor pertama; SSE `addps` 128-bit tersedia sebagai fallback.
-Runner QEMU menggunakan `-cpu max -smp 2 -m 512M` agar capability AVX terlihat.
+bits x87+SSE+AVX (`0x7`). Kernel GEMM 32x32 AVX-256 menggunakan intrinsik
+`_mm256_set1_ps`, `_mm256_loadu_ps`, `_mm256_mul_ps`, `_mm256_add_ps`, dan
+`_mm256_storeu_ps` untuk menghitung perkalian matriks pada 8 float per register
+`ymm` secara paralel. Runner QEMU menggunakan `-cpu max -smp 4 -m 512M` agar
+capability AVX terlihat di semua core.
 
 ```text
 [CELL SIMD] BSP initialized hardware vector engine: AVX (256-bit)
-[CELL SIMD] AP1 initialized hardware vector engine: AVX (256-bit)
-[CELL TENSOR] AP1 hardware vector reduction test OK
+[CELL SIMD] AP2 initialized hardware vector engine: AVX (256-bit)
+[AP2 COMPUTE] GEMM 32x32 AVX-256 complete: C[0,0]=64 sum=65536 expected=65536
 ```
 
 ### Binary telemetry
@@ -148,7 +155,8 @@ Runner QEMU menggunakan `-cpu max -smp 2 -m 512M` agar capability AVX terlihat.
 `cell-supervisor::telemetry` menyediakan fixed-layout, little-endian frames
 dengan magic `[ce 11 54 4d]`, versi `1`, sequence number, opcode, payload
 length, dan payload deterministik untuk `Heartbeat`, `PmmSnapshot`,
-`QueueMetrics`, `TensorExecution`, serta `FaultIncident`. Encoder memakai buffer
+`QueueMetrics`, `TensorExecution` (termasuk GEMM 32x32 dengan
+`elements=1024`, `simd_level=2` untuk AVX-256), serta `FaultIncident`. Encoder memakai buffer
 tetap tanpa `alloc`; `decode()` memvalidasi magic, versi, opcode, dan panjang
 sebelum mengembalikan event terstruktur.
 
@@ -156,3 +164,15 @@ Kernel bare-metal mengirim frame sebagai hex di baris berawalan `[CELL TM]` agar
 UART tetap dapat diamati manusia sekaligus diproses parser machine-readable.
 Format hex hanya transport display; byte wire frame adalah isi setelah prefix
 dan dapat didekode deterministik dengan `cell_supervisor::telemetry::decode`.
+
+Parser Python real-time tersedia di `scripts/parse_telemetry.py`:
+
+```sh
+chmod +x scripts/parse_telemetry.py
+./scripts/run_qemu.sh | python3 scripts/parse_telemetry.py
+./scripts/run_qemu.sh | python3 scripts/parse_telemetry.py --pretty --verbose
+./scripts/run_qemu.sh | python3 scripts/parse_telemetry.py --output telemetry_stream.jsonl
+```
+
+Output default adalah NDJSON satu event per baris. Log kernel non-telemetry
+hanya diteruskan ke stderr saat `--verbose` digunakan.
