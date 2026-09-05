@@ -214,3 +214,33 @@ chmod +x scripts/parse_telemetry.py
 
 Output default adalah NDJSON satu event per baris. Log kernel non-telemetry
 hanya diteruskan ke stderr saat `--verbose` digunakan.
+
+### Paged KV-Cache
+
+`cell-core` mengimplementasikan engine KV-Cache berbasis paged memory untuk
+inferensi LLM autoregresif. Setiap blok memori fisik PMM (16 KiB = 4 frame)
+menyimpan Key dan Value untuk sejumlah token tetap tanpa heap allocation.
+
+**Konstanta model:**
+- `TOKENS_PER_BLOCK = 4` (untuk f32: 4 token × 4096 byte = 16 KiB)
+- `NUM_HEADS = 8`, `HEAD_DIM = 64`
+- `BYTES_PER_TOKEN = 2 × 8 × 64 × 4 = 4096 byte` (K + V)
+
+**Struktur utama:**
+- `KvBlockDescriptor` — deskriptor blok fisik 64-byte aligned dengan `block_id`,
+  `phys_addr`, `virt_ptr`, `token_capacity`, dan `tokens_written`
+- `SequenceContext<MAX_BLOCKS>` — tabel blok per-sequence dengan `append_block()`
+  dan `reserve_next_token_slot()` yang mengembalikan pointer `(k_ptr, v_ptr)`
+
+**Lifecycle:**
+```
+PMM alloc → KvBlockDescriptor::new() → SequenceContext::append_block()
+→ reserve_next_token_slot() → tulis K/V via pointer → PMM free
+```
+
+Operasi slot bersifat deterministik O(1) tanpa fragmentasi. Ketika blok penuh,
+panggil `append_block()` dengan blok PMM baru sebelum reserve berikutnya.
+
+```sh
+cargo test -p cell-core  # 8 unit tests termasuk KV-Cache
+```

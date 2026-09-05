@@ -1,10 +1,12 @@
 #![no_std]
 
+pub mod kv_cache;
 pub mod task;
 pub mod tensor;
 
 use core::fmt;
 
+pub use kv_cache::{KvBlockDescriptor, SequenceContext, BLOCK_SIZE_BYTES, TOKENS_PER_BLOCK};
 pub use task::{TaskDescriptor, TensorOp};
 pub use tensor::{DType, MutableState, Ready, TensorChunk, TensorShape};
 
