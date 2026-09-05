@@ -3,14 +3,18 @@
 
 mod pmm;
 
-use cell_core::{RawPayload, TraceContext, ValidatorCapability, WorkResult};
+use cell_core::{
+    DType, MutableState, RawPayload, TensorChunk, TensorShape, TraceContext, ValidatorCapability,
+    WorkResult,
+};
 use cell_queue::SpscQueue;
 use cell_supervisor::Supervisor;
 use core::arch::asm;
 use core::fmt::{self, Write};
+use core::mem::size_of;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use limine::mp::Cpu;
-use limine::request::{MemoryMapRequest, RequestsEndMarker, RequestsStartMarker};
+use limine::request::{HhdmRequest, MemoryMapRequest, RequestsEndMarker, RequestsStartMarker};
 use limine::BaseRevision;
 
 #[used]
@@ -31,15 +35,23 @@ static SMP_REQUEST: limine::request::SmpRequest = limine::request::SmpRequest::n
 static MEMMAP_REQUEST: MemoryMapRequest = MemoryMapRequest::new();
 
 #[used]
+#[link_section = ".limine_requests"]
+static HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
+
+#[used]
 #[link_section = ".requests_end_marker"]
 static REQUESTS_END_MARKER: RequestsEndMarker = RequestsEndMarker::new();
 
 const COM1: u16 = 0x3f8;
 const PACKET_COUNT: usize = 10;
+const TENSOR_ELEMENTS: usize = 1024;
 static INTER_CORE_QUEUE: SpscQueue<RawPayload, 16> = SpscQueue::new();
 static COMPLETION_QUEUE: SpscQueue<WorkResult, 32> = SpscQueue::new();
+static TENSOR_QUEUE: SpscQueue<TensorChunk<cell_core::Ready>, 2> = SpscQueue::new();
 static AP_READY: AtomicBool = AtomicBool::new(false);
 static AP_PROCESSED: AtomicUsize = AtomicUsize::new(0);
+static TENSOR_COMPLETE: AtomicBool = AtomicBool::new(false);
+static TENSOR_SUM_BITS: AtomicUsize = AtomicUsize::new(0);
 static SERIAL_LOCK: AtomicBool = AtomicBool::new(false);
 
 struct Serial;
@@ -154,6 +166,33 @@ pub extern "C" fn _start() -> ! {
     }
     serial_println!("[CELL PMM] frame returned to bitmap");
 
+    let Some(hhdm) = HHDM_REQUEST.get_response() else {
+        serial_println!("[CELL PMM] no Limine HHDM response");
+        halt();
+    };
+    let tensor_frame = unsafe { pmm::allocate_frame() }.unwrap_or_else(|| halt());
+    let tensor_virtual = hhdm
+        .offset()
+        .checked_add(tensor_frame.address())
+        .unwrap_or_else(|| halt()) as usize as *mut u8;
+    let mut tensor = TensorChunk::<MutableState>::new(
+        TraceContext::new(100, 100, 0),
+        tensor_frame.address() as usize,
+        tensor_virtual,
+        TensorShape::new_1d(TENSOR_ELEMENTS),
+        DType::F32,
+    );
+    let one = 1.0_f32.to_ne_bytes();
+    for bytes in tensor.as_mut_slice().chunks_exact_mut(size_of::<f32>()) {
+        bytes.copy_from_slice(&one);
+    }
+    let tensor = tensor.freeze();
+    serial_println!(
+        "[CELL TENSOR] BSP prepared {} F32 elements phys=0x{:x}",
+        TENSOR_ELEMENTS,
+        tensor_frame.address()
+    );
+
     let Some(response) = SMP_REQUEST.get_response() else {
         serial_println!("[CELL SMP] no Limine SMP response");
         halt();
@@ -187,6 +226,20 @@ pub extern "C" fn _start() -> ! {
             core::hint::spin_loop();
         }
     }
+
+    if TENSOR_QUEUE.push(tensor).is_err() {
+        serial_println!("[CELL TENSOR] tensor queue unexpectedly full");
+        halt();
+    }
+    while !TENSOR_COMPLETE.load(Ordering::Acquire) {
+        core::hint::spin_loop();
+    }
+    let tensor_sum = f32::from_bits(TENSOR_SUM_BITS.load(Ordering::Acquire) as u32);
+    serial_println!(
+        "[CELL TENSOR] AP1 zero-copy reduction sum={} expected={}",
+        tensor_sum,
+        TENSOR_ELEMENTS
+    );
 
     let mut supervisor = Supervisor::<PACKET_COUNT>::new();
     let mut reports = 0;
@@ -259,6 +312,39 @@ unsafe extern "C" fn ap_entry(_cpu: &Cpu) -> ! {
         } else {
             core::hint::spin_loop();
         }
+    }
+
+    loop {
+        let Some(tensor) = TENSOR_QUEUE.pop() else {
+            core::hint::spin_loop();
+            continue;
+        };
+        let (sum, element_count) = {
+            let values = tensor.as_slice::<f32>();
+            let mut sum = 0.0_f32;
+            for value in values {
+                sum += *value;
+            }
+            (sum, values.len())
+        };
+        let (context, phys_addr) = tensor.deconstruct();
+        let sum_bits = sum.to_bits() as usize;
+        TENSOR_SUM_BITS.store(sum_bits, Ordering::Release);
+        // SAFETY: BSP initialized PMM before starting the AP and transfers this
+        // frame exclusively to AP1 through TensorChunk ownership.
+        let returned = pmm::free_frame(pmm::PhysicalFrame::from_address(phys_addr));
+        if returned && sum == TENSOR_ELEMENTS as f32 {
+            serial_println!(
+                "[CELL TENSOR] AP1 trace={} reduced {} elements and freed phys=0x{:x}",
+                context.trace_id,
+                element_count,
+                phys_addr
+            );
+        } else {
+            serial_println!("[CELL TENSOR] reduction or frame release failed");
+        }
+        TENSOR_COMPLETE.store(true, Ordering::Release);
+        break;
     }
     halt()
 }

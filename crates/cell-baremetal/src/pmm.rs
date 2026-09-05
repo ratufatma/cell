@@ -11,6 +11,12 @@ pub struct PhysicalFrame {
 }
 
 impl PhysicalFrame {
+    pub const fn from_address(address: usize) -> Self {
+        Self {
+            number: address / FRAME_SIZE as usize,
+        }
+    }
+
     pub const fn number(self) -> usize {
         self.number
     }
@@ -141,7 +147,9 @@ pub unsafe fn allocate_frame() -> Option<PhysicalFrame> {
     (*core::ptr::addr_of_mut!(PMM)).allocate()
 }
 
-/// SAFETY: Only the BSP frees frames in the current kernel design.
+/// SAFETY: The caller must own the frame exclusively. In the tensor pipeline,
+/// ownership is transferred from BSP to AP through TensorChunk before AP calls
+/// this function; no other PMM operation runs concurrently.
 pub unsafe fn free_frame(frame: PhysicalFrame) -> bool {
     (*core::ptr::addr_of_mut!(PMM)).free(frame)
 }

@@ -89,3 +89,17 @@ Validasi compile kernel tanpa boot QEMU:
 ```sh
 cargo check --target x86_64-unknown-none -p cell-baremetal
 ```
+
+### TensorChunk zero-copy antar-core
+
+BSP meminta HHDM offset Limine, mengalokasikan satu frame 4 KiB dari PMM, lalu
+mengisinya dengan 1024 elemen `F32`. Descriptor `TensorChunk<Ready>` dikirim
+melalui `TENSOR_QUEUE` ke AP tanpa menyalin buffer. AP membaca `&[f32]`,
+menjumlahkan seluruh elemen, memvalidasi hasil `1024`, lalu mengembalikan frame
+ke PMM setelah `deconstruct()`:
+
+```text
+[CELL TENSOR] BSP prepared 1024 F32 elements phys=0x53000
+[CELL TENSOR] AP1 trace=100 reduced 1024 elements and freed phys=0x53000
+[CELL TENSOR] AP1 zero-copy reduction sum=1024 expected=1024
+```
