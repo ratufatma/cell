@@ -1,0 +1,9 @@
+[target.x86_64-unknown-none]
+rustflags = [
+	"-C",
+	"relocation-model=static",
+	"-C",
+	"link-arg=-T/mnt/HDD/cell/crates/cell-baremetal/linker.ld",
+	"-C",
+	"link-arg=-no-pie",
+]

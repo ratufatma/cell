@@ -1,0 +1,9 @@
+[package]
+name = "simulation-harness"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+cell-core = { path = "../../crates/cell-core" }
+cell-queue = { path = "../../crates/cell-queue" }
+cell-supervisor = { path = "../../crates/cell-supervisor" }

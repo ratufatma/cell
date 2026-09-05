@@ -1,0 +1,9 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/cell-core",
+    "crates/cell-queue",
+    "crates/cell-supervisor",
+    "crates/cell-baremetal",
+    "tests/simulation_harness",
+]
