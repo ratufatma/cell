@@ -23,6 +23,8 @@ from typing import Set
 TIMEOUT_SECONDS = 30
 HEX_TELEMETRY_REGEX = re.compile(r"\[CELL TM\]\s+([0-9a-fA-F]+)")
 
+transformer_block_checksum_verified = False
+
 
 def run_verification() -> int:
     workspace_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -84,6 +86,7 @@ def run_verification() -> int:
     queue_metrics_payload_valid = False
     attention_checksum_verified = False
     rmsnorm_checksum_verified = False
+    transformer_block_checksum_verified = False
     pmm_free_count = 0
 
     for line_str in full_output.splitlines():
@@ -115,6 +118,12 @@ def run_verification() -> int:
 
         if "RMSNorm verified sum=" in line_str and "expected=32.00" in line_str:
             rmsnorm_checksum_verified = True
+
+        if (
+            "Full Transformer Block verified sum=418.42" in line_str
+            and "expected=418.42" in line_str
+        ):
+            transformer_block_checksum_verified = True
 
         if "Trace 4 isolated failure captured" in line_str:
             fault_trace_isolated = True
@@ -203,6 +212,11 @@ def run_verification() -> int:
             "AVX RMSNorm Checksum (sum=32.00)",
             rmsnorm_checksum_verified,
             "Root Mean Square Normalization exact",
+        ),
+        (
+            "Full Transformer Block Checksum (sum=418.42)",
+            transformer_block_checksum_verified,
+            "Norm -> Attn -> Res -> Norm -> FFN -> Res exact",
         ),
     ]
 
