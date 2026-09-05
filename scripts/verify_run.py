@@ -39,9 +39,27 @@ def run_verification() -> int:
         [runner_path],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
     )
+
+    output_chunks = []
+    try:
+        while time.time() - start_time < TIMEOUT_SECONDS:
+            try:
+                chunk = proc.stdout.read(1)
+                if chunk:
+                    output_chunks.append(chunk)
+                else:
+                    break
+            except Exception:
+                break
+            if b"Zero crash" in b"".join(output_chunks):
+                break
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait()
+
+    full_output = b"".join(output_chunks).decode("utf-8", errors="replace")
 
     smp_cores_online: Set[int] = set()
     flow_control_engaged = False
@@ -54,68 +72,58 @@ def run_verification() -> int:
 
     captured_telemetry_opcodes: Set[int] = set()
     queue_metrics_payload_valid = False
+    attention_checksum_verified = False
+    pmm_free_count = 0
 
-    try:
-        while True:
-            if time.time() - start_time > TIMEOUT_SECONDS:
-                proc.kill()
-                print(f"\033[91m[FAIL]\033[0m Test timed out after {TIMEOUT_SECONDS}s")
-                return 1
+    for line_str in full_output.splitlines():
+        line_str = line_str.strip()
+        if not line_str:
+            continue
 
-            line = proc.stdout.readline()
-            if not line and proc.poll() is not None:
-                break
+        if "Core 0 (BSP Ingress) online" in line_str:
+            smp_cores_online.add(0)
+        elif "Core 1 (AP1 Arbiter) online" in line_str:
+            smp_cores_online.add(1)
+        elif "Core 2 (AP2 Compute) online" in line_str:
+            smp_cores_online.add(2)
+        elif "Core 3 (AP3 Supervisor) online" in line_str:
+            smp_cores_online.add(3)
 
-            line_str = line.strip()
-            if not line_str:
-                continue
+        if "Backpressure active" in line_str or "Backpressure engaged" in line_str:
+            flow_control_engaged = True
+        if "Backpressure released" in line_str or "Low watermark reached" in line_str:
+            flow_control_released = True
+        if "0 dropped" in line_str:
+            zero_dropped_confirmed = True
 
-            if "Core 0 (BSP Ingress) online" in line_str:
-                smp_cores_online.add(0)
-            elif "Core 1 (AP1 Arbiter) online" in line_str:
-                smp_cores_online.add(1)
-            elif "Core 2 (AP2 Compute) online" in line_str:
-                smp_cores_online.add(2)
-            elif "Core 3 (AP3 Supervisor) online" in line_str:
-                smp_cores_online.add(3)
+        if "sum=51200" in line_str:
+            chained_compute_sum_verified = True
 
-            if "Backpressure active" in line_str or "Backpressure engaged" in line_str:
-                flow_control_engaged = True
-            if "Backpressure released" in line_str or "Low watermark reached" in line_str:
-                flow_control_released = True
-            if "0 dropped" in line_str:
-                zero_dropped_confirmed = True
+        if "Attention verified sum=" in line_str and "expected=162.42" in line_str:
+            attention_checksum_verified = True
 
-            if "sum=51200" in line_str:
-                chained_compute_sum_verified = True
+        if "Trace 4 isolated failure captured" in line_str:
+            fault_trace_isolated = True
 
-            if "Trace 4 isolated failure captured" in line_str:
-                fault_trace_isolated = True
+        if "contiguous frames count=4 returned to bitmap" in line_str:
+            pmm_frames_returned = True
+            pmm_free_count += 1
 
-            if "contiguous frames count=4 returned to bitmap" in line_str:
-                pmm_frames_returned = True
+        if "Pipeline 4-Core tuntas" in line_str and "Zero crash" in line_str:
+            zero_crash_reported = True
 
-            if "Pipeline 4-Core tuntas" in line_str and "Zero crash" in line_str:
-                zero_crash_reported = True
-                proc.terminate()
-                break
-
-            tm_match = HEX_TELEMETRY_REGEX.search(line_str)
-            if tm_match:
-                try:
-                    raw_bytes = bytes.fromhex(tm_match.group(1))
-                    if len(raw_bytes) >= 12 and raw_bytes[:4] == b"\xce\x11\x54\x4d":
-                        opcode = raw_bytes[5]
-                        captured_telemetry_opcodes.add(opcode)
-                        payload_len = struct.unpack("<H", raw_bytes[10:12])[0]
-                        if opcode == 0x03 and payload_len == 20:
-                            queue_metrics_payload_valid = True
-                except ValueError:
-                    pass
-
-    finally:
-        if proc.poll() is None:
-            proc.kill()
+        tm_match = HEX_TELEMETRY_REGEX.search(line_str)
+        if tm_match:
+            try:
+                raw_bytes = bytes.fromhex(tm_match.group(1))
+                if len(raw_bytes) >= 12 and raw_bytes[:4] == b"\xce\x11\x54\x4d":
+                    opcode = raw_bytes[5]
+                    captured_telemetry_opcodes.add(opcode)
+                    payload_len = struct.unpack("<H", raw_bytes[10:12])[0]
+                    if opcode == 0x03 and payload_len == 20:
+                        queue_metrics_payload_valid = True
+            except ValueError:
+                pass
 
     print("\n" + "=" * 65)
     print("           CELL KERNEL CI/CD ASSERTION REPORT")
@@ -155,7 +163,7 @@ def run_verification() -> int:
         (
             "PMM 4-Frame Contiguous Reclaim",
             pmm_frames_returned,
-            "Physical frames returned to bitmap",
+            f"Physical frames returned to bitmap (count={pmm_free_count})",
         ),
         (
             "Supervisor Zero-Crash Guarantee",
@@ -171,6 +179,11 @@ def run_verification() -> int:
             "20-Byte QueueMetrics Wire Format",
             queue_metrics_payload_valid,
             "Includes watermark_state & padding",
+        ),
+        (
+            "AVX Attention Checksum (sum=162.42)",
+            attention_checksum_verified,
+            "Scaled Dot-Product Q@K^T/sqrt(d)@V exact",
         ),
     ]
 

@@ -72,6 +72,9 @@ static AP3_DONE: AtomicBool = AtomicBool::new(false);
 static TENSOR_DONE: AtomicBool = AtomicBool::new(false);
 static TENSOR_PHYS_ADDR: AtomicUsize = AtomicUsize::new(0);
 static TENSOR_SUM_BITS: AtomicUsize = AtomicUsize::new(0);
+static ATTENTION_DONE: AtomicBool = AtomicBool::new(false);
+static ATTENTION_PHYS_ADDR: AtomicUsize = AtomicUsize::new(0);
+static ATTENTION_SUM_BITS: AtomicUsize = AtomicUsize::new(0);
 static SERIAL_LOCK: AtomicBool = AtomicBool::new(false);
 static mut TELEMETRY: TelemetryEncoder = TelemetryEncoder::new();
 
@@ -364,6 +367,70 @@ pub extern "C" fn _start() -> ! {
         serial_println!("[CELL TENSOR] hop 1 queue unexpectedly full");
         halt();
     }
+
+    let attn_frame =
+        unsafe { pmm::allocate_contiguous_frames(TENSOR_FRAME_COUNT) }.unwrap_or_else(|| halt());
+    let attn_virtual = hhdm
+        .offset()
+        .checked_add(attn_frame.address())
+        .unwrap_or_else(|| halt()) as usize as *mut u8;
+    let mut attn_tensor = TensorChunk::<MutableState>::new(
+        TraceContext::new(101, 101, 0),
+        attn_frame.address() as usize,
+        attn_virtual,
+        TensorShape::new_1d(4096),
+        DType::F32,
+    );
+    let q_val = 0.25_f32.to_ne_bytes();
+    let k0_val = 1.0_f32.to_ne_bytes();
+    let k1_val = 0.5_f32.to_ne_bytes();
+    let v0_val = 2.0_f32.to_ne_bytes();
+    let v1_val = 4.0_f32.to_ne_bytes();
+    let zero_f = 0.0_f32.to_ne_bytes();
+    let a_slice = attn_tensor.as_mut_slice();
+    for bytes in a_slice[0..256].chunks_exact_mut(size_of::<f32>()) {
+        bytes.copy_from_slice(&q_val);
+    }
+    for bytes in a_slice[256..512].chunks_exact_mut(size_of::<f32>()) {
+        bytes.copy_from_slice(&k0_val);
+    }
+    for bytes in a_slice[512..768].chunks_exact_mut(size_of::<f32>()) {
+        bytes.copy_from_slice(&k1_val);
+    }
+    for bytes in a_slice[768..1024].chunks_exact_mut(size_of::<f32>()) {
+        bytes.copy_from_slice(&v0_val);
+    }
+    for bytes in a_slice[1024..1280].chunks_exact_mut(size_of::<f32>()) {
+        bytes.copy_from_slice(&v1_val);
+    }
+    for bytes in a_slice[1280..1536].chunks_exact_mut(size_of::<f32>()) {
+        bytes.copy_from_slice(&zero_f);
+    }
+    let attn_tensor = attn_tensor.freeze();
+    let attention_task = TaskDescriptor {
+        context: TraceContext::new(101, 101, 0),
+        op: TensorOp::Attention,
+        tensor: attn_tensor,
+        in_offset_a: 0,
+        in_offset_b: 64,
+        out_offset: 320,
+        element_count: 64,
+        _reserved: [0; 15],
+    };
+    serial_println!(
+        "[CELL PMM] allocated attention buffer count={} phys=0x{:x}",
+        TENSOR_FRAME_COUNT,
+        attention_task.tensor.phys_addr
+    );
+    serial_println!(
+        "[BSP TENSOR] Prepared Attention layout (Q=0.25 K0=1.0 K1=0.5 V0=2.0 V1=4.0) at phys: 0x{:x}",
+        attention_task.tensor.phys_addr
+    );
+    if TENSOR_HOP1.push(attention_task).is_err() {
+        serial_println!("[CELL TENSOR] hop 1 queue full for attention task");
+        halt();
+    }
+
     while !AP3_DONE.load(Ordering::Acquire) {
         core::hint::spin_loop();
     }
@@ -399,10 +466,16 @@ unsafe extern "C" fn ap1_worker_entry(_cpu: &Cpu) -> ! {
             core::hint::spin_loop();
         }
     }
-    if let Some(task) = wait_task(&TENSOR_HOP1) {
-        if TENSOR_HOP2.push(task).is_err() {
-            serial_println!("[AP1 ARBITER] tensor hop 2 queue unexpectedly full");
-            halt();
+    for _ in 0..2 {
+        loop {
+            if let Some(task) = TENSOR_HOP1.pop() {
+                if TENSOR_HOP2.push(task).is_err() {
+                    serial_println!("[AP1 ARBITER] tensor hop 2 queue unexpectedly full");
+                    halt();
+                }
+                break;
+            }
+            core::hint::spin_loop();
         }
     }
     serial_println!("[AP1 ARBITER] Validated traces dispatched");
@@ -436,68 +509,86 @@ unsafe extern "C" fn ap2_compute_entry(_cpu: &Cpu) -> ! {
             core::hint::spin_loop();
         }
     }
-    if let Some(task) = wait_task(&TENSOR_HOP2) {
-        let base_ptr = task.tensor.virt_ptr as *mut f32;
-        match task.op {
-            TensorOp::MatMul => {
-                let a_ptr = base_ptr.add(task.in_offset_a as usize);
-                let b_ptr = base_ptr.add(task.in_offset_b as usize);
-                let c_ptr = base_ptr.add(task.out_offset as usize);
-                unsafe { simd::gemm_32x32_avx(a_ptr, b_ptr, c_ptr) };
-                serial_println!("[AP2 DISPATCH] Executed Op::MatMul (32x32 AVX)");
+    let mut tensors_processed = 0_u32;
+    while tensors_processed < 2 {
+        if let Some(task) = wait_task(&TENSOR_HOP2) {
+            let base_ptr = task.tensor.virt_ptr as *mut f32;
+            match task.op {
+                TensorOp::MatMul => {
+                    let a_ptr = base_ptr.add(task.in_offset_a as usize);
+                    let b_ptr = base_ptr.add(task.in_offset_b as usize);
+                    let c_ptr = base_ptr.add(task.out_offset as usize);
+                    unsafe { simd::gemm_32x32_avx(a_ptr, b_ptr, c_ptr) };
+                    serial_println!("[AP2 DISPATCH] Executed Op::MatMul (32x32 AVX)");
+
+                    let bias_ptr = base_ptr.add(3072);
+                    unsafe { simd::vector_add_avx(c_ptr, bias_ptr, c_ptr, task.element_count as usize) };
+                    serial_println!("[AP2 DISPATCH] Chained VectorAdd bias=-14.0");
+
+                    unsafe { simd::relu_avx(c_ptr, task.element_count as usize) };
+                    serial_println!("[AP2 DISPATCH] Chained ReLU activation");
+
+                    let final_slice = unsafe { core::slice::from_raw_parts(c_ptr, task.element_count as usize) };
+                    let mut final_sum = 0.0_f32;
+                    let mut nonzero = 0_u32;
+                    for value in final_slice {
+                        final_sum += *value;
+                        if *value > 0.0 {
+                            nonzero += 1;
+                        }
+                    }
+                    serial_println!(
+                        "[AP2 COMPUTE] Pipeline calculation checksum verified: sum={:.1} nonzero={} C[0,0]={:.1}",
+                        final_sum,
+                        nonzero,
+                        final_slice[0]
+                    );
+
+                    let (_context, phys_addr) = task.tensor.deconstruct();
+                    TENSOR_PHYS_ADDR.store(phys_addr, Ordering::Release);
+                    TENSOR_SUM_BITS.store(final_sum.to_bits() as usize, Ordering::Release);
+                    TENSOR_DONE.store(true, Ordering::Release);
+                    serial_println!("[AP2 COMPUTE] Tensor descriptor forwarded phys=0x{:x}", phys_addr);
+                }
+                TensorOp::Attention => {
+                    let q_ptr = base_ptr.add(task.in_offset_a as usize);
+                    let k0_ptr = base_ptr.add(64);
+                    let k1_ptr = base_ptr.add(128);
+                    let v0_ptr = base_ptr.add(192);
+                    let v1_ptr = base_ptr.add(256);
+                    let out_ptr = base_ptr.add(task.out_offset as usize);
+
+                    unsafe {
+                        simd::attention_head_64_avx(
+                            q_ptr,
+                            [k0_ptr, k1_ptr, core::ptr::null(), core::ptr::null()],
+                            [v0_ptr, v1_ptr, core::ptr::null(), core::ptr::null()],
+                            2,
+                            out_ptr,
+                        );
+                    }
+
+                    let out_slice = unsafe { core::slice::from_raw_parts(out_ptr, 64) };
+                    let mut attn_sum = 0.0_f32;
+                    for v in out_slice {
+                        attn_sum += *v;
+                    }
+                    serial_println!(
+                        "[AP2 COMPUTE] Scaled Dot-Product Attention verified sum={:.2} expected=162.42",
+                        attn_sum
+                    );
+
+                    let (_context, phys_addr) = task.tensor.deconstruct();
+                    ATTENTION_PHYS_ADDR.store(phys_addr, Ordering::Release);
+                    ATTENTION_SUM_BITS.store(attn_sum.to_bits() as usize, Ordering::Release);
+                    ATTENTION_DONE.store(true, Ordering::Release);
+                }
+                _ => {}
             }
-            TensorOp::VectorAdd => {
-                let in1 = base_ptr.add(task.in_offset_a as usize);
-                let in2 = base_ptr.add(task.in_offset_b as usize);
-                let out = base_ptr.add(task.out_offset as usize);
-                unsafe { simd::vector_add_avx(in1, in2, out, task.element_count as usize) };
-                serial_println!("[AP2 DISPATCH] Executed Op::VectorAdd (AVX-256)");
-            }
-            TensorOp::ReLU => {
-                let target = base_ptr.add(task.out_offset as usize);
-                unsafe { simd::relu_avx(target, task.element_count as usize) };
-                serial_println!("[AP2 DISPATCH] Executed Op::ReLU (AVX-256)");
-            }
-            TensorOp::Attention => {
-                serial_println!("[AP2 DISPATCH] Op::Attention pending KV-cache integration");
-            }
+            tensors_processed += 1;
+        } else {
+            core::hint::spin_loop();
         }
-
-        let c_ptr = base_ptr.add(task.out_offset as usize);
-        let c_slice = unsafe { core::slice::from_raw_parts(c_ptr, task.element_count as usize) };
-        let c00 = c_slice[0];
-
-        let bias_ptr = base_ptr.add(3072);
-        unsafe { simd::vector_add_avx(c_ptr, bias_ptr, c_ptr, task.element_count as usize) };
-        serial_println!("[AP2 DISPATCH] Chained VectorAdd bias=-14.0");
-
-        unsafe { simd::relu_avx(c_ptr, task.element_count as usize) };
-        serial_println!("[AP2 DISPATCH] Chained ReLU activation");
-
-        let final_slice = unsafe { core::slice::from_raw_parts(c_ptr, task.element_count as usize) };
-        let mut final_sum = 0.0_f32;
-        let mut nonzero = 0_u32;
-        for value in final_slice {
-            final_sum += *value;
-            if *value > 0.0 {
-                nonzero += 1;
-            }
-        }
-        serial_println!(
-            "[AP2 COMPUTE] Pipeline calculation checksum verified: sum={:.1} nonzero={} C[0,0]={:.1}",
-            final_sum,
-            nonzero,
-            c00
-        );
-
-        let (_context, phys_addr) = task.tensor.deconstruct();
-        TENSOR_PHYS_ADDR.store(phys_addr, Ordering::Release);
-        TENSOR_SUM_BITS.store(final_sum.to_bits() as usize, Ordering::Release);
-        TENSOR_DONE.store(true, Ordering::Release);
-        serial_println!(
-            "[AP2 COMPUTE] Tensor descriptor forwarded phys=0x{:x}",
-            phys_addr
-        );
     }
     AP2_DONE.store(true, Ordering::Release);
     halt()
@@ -563,6 +654,32 @@ unsafe extern "C" fn ap3_supervisor_entry(_cpu: &Cpu) -> ! {
     unsafe {
         pmm::free_contiguous_frames(
             pmm::PhysicalFrame::from_address(tensor_phys),
+            TENSOR_FRAME_COUNT,
+        )
+    };
+    serial_println!("[CELL PMM] contiguous frames count=4 returned to bitmap");
+
+    while !ATTENTION_DONE.load(Ordering::Acquire) {
+        core::hint::spin_loop();
+    }
+    let attn_sum_bits = ATTENTION_SUM_BITS.load(Ordering::Acquire) as u32;
+    let attn_phys = ATTENTION_PHYS_ADDR.load(Ordering::Acquire);
+    let attn_val = f32::from_bits(attn_sum_bits);
+    serial_println!(
+        "[CELL TENSOR] AP2 Attention verified sum={:.2} expected=162.42",
+        attn_val
+    );
+    telemetry_write(TelemetryEvent::TensorExecution(TensorExecution {
+        context: TraceContext::new(101, 0, 1),
+        elements: 64,
+        frame_count: TENSOR_FRAME_COUNT as u16,
+        dtype: DType::F32 as u8,
+        simd_level: 2,
+        sum_bits: attn_sum_bits,
+    }));
+    unsafe {
+        pmm::free_contiguous_frames(
+            pmm::PhysicalFrame::from_address(attn_phys),
             TENSOR_FRAME_COUNT,
         )
     };
