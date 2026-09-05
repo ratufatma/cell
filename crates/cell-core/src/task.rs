@@ -9,6 +9,7 @@ pub enum TensorOp {
     ReLU = 0x03,
     Attention = 0x04,
     RMSNorm = 0x05,
+    TransformerBlock = 0x06,
 }
 
 #[repr(C, align(64))]

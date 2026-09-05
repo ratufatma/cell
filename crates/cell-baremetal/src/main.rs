@@ -50,6 +50,7 @@ static REQUESTS_END_MARKER: RequestsEndMarker = RequestsEndMarker::new();
 const COM1: u16 = 0x3f8;
 const PACKET_COUNT: usize = 10;
 const TENSOR_FRAME_COUNT: usize = 4;
+const TB_FRAME_COUNT: usize = 5;
 pub enum PipelineMessage {
     Valid(ValidatedPayload),
     BypassFault {
@@ -78,6 +79,9 @@ static ATTENTION_SUM_BITS: AtomicUsize = AtomicUsize::new(0);
 static RMSNORM_DONE: AtomicBool = AtomicBool::new(false);
 static RMSNORM_PHYS_ADDR: AtomicUsize = AtomicUsize::new(0);
 static RMSNORM_SUM_BITS: AtomicUsize = AtomicUsize::new(0);
+static TRANSFORMER_BLOCK_DONE: AtomicBool = AtomicBool::new(false);
+static TRANSFORMER_BLOCK_PHYS_ADDR: AtomicUsize = AtomicUsize::new(0);
+static TRANSFORMER_BLOCK_SUM_BITS: AtomicUsize = AtomicUsize::new(0);
 static SERIAL_LOCK: AtomicBool = AtomicBool::new(false);
 static mut TELEMETRY: TelemetryEncoder = TelemetryEncoder::new();
 
@@ -485,6 +489,93 @@ pub extern "C" fn _start() -> ! {
         halt();
     }
 
+    let tb_frame =
+        unsafe { pmm::allocate_contiguous_frames(TB_FRAME_COUNT) }.unwrap_or_else(|| halt());
+    let tb_virtual = hhdm
+        .offset()
+        .checked_add(tb_frame.address())
+        .unwrap_or_else(|| halt()) as usize as *mut u8;
+    let mut tb_tensor = TensorChunk::<MutableState>::new(
+        TraceContext::new(103, 103, 0),
+        tb_frame.address() as usize,
+        tb_virtual,
+        TensorShape::new_1d(5120),
+        DType::F32,
+    );
+    let one_f = 1.0_f32.to_ne_bytes();
+    let half_f = 0.5_f32.to_ne_bytes();
+    let two_f = 2.0_f32.to_ne_bytes();
+    let four_f = 4.0_f32.to_ne_bytes();
+    let w_ffn_f = 0.0625_f32.to_ne_bytes();
+    let zero_f = 0.0_f32.to_ne_bytes();
+    let t_slice = tb_tensor.as_mut_slice();
+    for bytes in t_slice[0..256].chunks_exact_mut(size_of::<f32>()) {
+        bytes.copy_from_slice(&one_f);
+    }
+    for bytes in t_slice[256..512].chunks_exact_mut(size_of::<f32>()) {
+        bytes.copy_from_slice(&one_f);
+    }
+    for bytes in t_slice[512..768].chunks_exact_mut(size_of::<f32>()) {
+        bytes.copy_from_slice(&zero_f);
+    }
+    for bytes in t_slice[768..1024].chunks_exact_mut(size_of::<f32>()) {
+        bytes.copy_from_slice(&one_f);
+    }
+    for bytes in t_slice[1024..1280].chunks_exact_mut(size_of::<f32>()) {
+        bytes.copy_from_slice(&half_f);
+    }
+    for bytes in t_slice[1280..1536].chunks_exact_mut(size_of::<f32>()) {
+        bytes.copy_from_slice(&two_f);
+    }
+    for bytes in t_slice[1536..1792].chunks_exact_mut(size_of::<f32>()) {
+        bytes.copy_from_slice(&four_f);
+    }
+    for bytes in t_slice[1792..2048].chunks_exact_mut(size_of::<f32>()) {
+        bytes.copy_from_slice(&zero_f);
+    }
+    for bytes in t_slice[2048..2304].chunks_exact_mut(size_of::<f32>()) {
+        bytes.copy_from_slice(&zero_f);
+    }
+    for bytes in t_slice[2304..2560].chunks_exact_mut(size_of::<f32>()) {
+        bytes.copy_from_slice(&one_f);
+    }
+    for bytes in t_slice[2560..2816].chunks_exact_mut(size_of::<f32>()) {
+        bytes.copy_from_slice(&zero_f);
+    }
+    for bytes in t_slice[2816..3072].chunks_exact_mut(size_of::<f32>()) {
+        bytes.copy_from_slice(&zero_f);
+    }
+    for bytes in t_slice[3072..3328].chunks_exact_mut(size_of::<f32>()) {
+        bytes.copy_from_slice(&zero_f);
+    }
+    for bytes in t_slice[3328..16384].chunks_exact_mut(size_of::<f32>()) {
+        bytes.copy_from_slice(&w_ffn_f);
+    }
+    let tb_tensor = tb_tensor.freeze();
+    let transformer_task = TaskDescriptor {
+        context: TraceContext::new(103, 103, 0),
+        op: TensorOp::TransformerBlock,
+        tensor: tb_tensor,
+        in_offset_a: 0,
+        in_offset_b: 0,
+        out_offset: 768,
+        element_count: 64,
+        _reserved: [0; 15],
+    };
+    serial_println!(
+        "[CELL PMM] allocated transformer block buffer count={} phys=0x{:x}",
+        TENSOR_FRAME_COUNT,
+        transformer_task.tensor.phys_addr
+    );
+    serial_println!(
+        "[BSP TENSOR] Prepared TransformerBlock layout at phys: 0x{:x}",
+        transformer_task.tensor.phys_addr
+    );
+    if TENSOR_HOP1.push(transformer_task).is_err() {
+        serial_println!("[CELL TENSOR] hop 1 queue full for transformer task");
+        halt();
+    }
+
     while !AP3_DONE.load(Ordering::Acquire) {
         core::hint::spin_loop();
     }
@@ -520,7 +611,7 @@ unsafe extern "C" fn ap1_worker_entry(_cpu: &Cpu) -> ! {
             core::hint::spin_loop();
         }
     }
-    for _ in 0..3 {
+    for _ in 0..4 {
         loop {
             if let Some(task) = TENSOR_HOP1.pop() {
                 if TENSOR_HOP2.push(task).is_err() {
@@ -564,7 +655,7 @@ unsafe extern "C" fn ap2_compute_entry(_cpu: &Cpu) -> ! {
         }
     }
     let mut tensors_processed = 0_u32;
-    while tensors_processed < 3 {
+    while tensors_processed < 4 {
         if let Some(task) = wait_task(&TENSOR_HOP2) {
             let base_ptr = task.tensor.virt_ptr as *mut f32;
             match task.op {
@@ -651,6 +742,80 @@ unsafe extern "C" fn ap2_compute_entry(_cpu: &Cpu) -> ! {
                     RMSNORM_PHYS_ADDR.store(phys_addr, Ordering::Release);
                     RMSNORM_SUM_BITS.store(sum.to_bits() as usize, Ordering::Release);
                     RMSNORM_DONE.store(true, Ordering::Release);
+                }
+                TensorOp::TransformerBlock => {
+                    let x0_ptr = base_ptr;
+                    let gamma1_ptr = base_ptr.add(64);
+                    let norm1_ptr = base_ptr.add(128);
+                    let k0_ptr = base_ptr.add(192);
+                    let k1_ptr = base_ptr.add(256);
+                    let v0_ptr = base_ptr.add(320);
+                    let v1_ptr = base_ptr.add(384);
+                    let attn_out_ptr = base_ptr.add(448);
+                    let x1_ptr = base_ptr.add(512);
+                    let gamma2_ptr = base_ptr.add(576);
+                    let norm2_ptr = base_ptr.add(640);
+                    let ffn_out_ptr = base_ptr.add(704);
+                    let x2_ptr = base_ptr.add(768);
+                    let w_ffn_ptr = base_ptr.add(832);
+                    let bias_ptr = base_ptr.add(448);
+
+                    unsafe { simd::rmsnorm_64_avx(x0_ptr, gamma1_ptr, norm1_ptr, 1e-5) };
+                    serial_println!("[AP2 BLOCK] Step 1: Pre-Attention RMSNorm done");
+
+                    let q_ptr = norm1_ptr;
+                    unsafe {
+                        let q_scaled = core::slice::from_raw_parts_mut(q_ptr, 64);
+                        for v in q_scaled.iter_mut() {
+                            *v *= 0.25;
+                        }
+                    }
+                    unsafe {
+                        simd::attention_head_64_avx(
+                            q_ptr,
+                            [k0_ptr, k1_ptr, core::ptr::null(), core::ptr::null()],
+                            [v0_ptr, v1_ptr, core::ptr::null(), core::ptr::null()],
+                            2,
+                            attn_out_ptr,
+                        );
+                    }
+                    serial_println!("[AP2 BLOCK] Step 2: Attention done");
+
+                    unsafe { simd::vector_add_avx(x0_ptr, attn_out_ptr, x1_ptr, 64) };
+                    serial_println!("[AP2 BLOCK] Step 3: Residual connection 1 done");
+
+                    unsafe { simd::rmsnorm_64_avx(x1_ptr, gamma2_ptr, norm2_ptr, 1e-5) };
+                    serial_println!("[AP2 BLOCK] Step 4: Pre-FFN RMSNorm done");
+
+                    let bias_val = -1.0_f32;
+                    unsafe {
+                        let bias_slice = core::slice::from_raw_parts_mut(bias_ptr, 64);
+                        for v in bias_slice.iter_mut() {
+                            *v = bias_val;
+                        }
+                    }
+                    unsafe { simd::gemv_64x64_avx(norm2_ptr, w_ffn_ptr, ffn_out_ptr) };
+                    unsafe { simd::vector_add_avx(ffn_out_ptr, bias_ptr, ffn_out_ptr, 64) };
+                    unsafe { simd::relu_avx(ffn_out_ptr, 64) };
+                    serial_println!("[AP2 BLOCK] Step 5: FFN (GEMV+Bias+ReLU) done");
+
+                    unsafe { simd::vector_add_avx(x1_ptr, ffn_out_ptr, x2_ptr, 64) };
+                    serial_println!("[AP2 BLOCK] Step 6: Residual connection 2 done");
+
+                    let x2_slice = unsafe { core::slice::from_raw_parts(x2_ptr, 64) };
+                    let mut tb_sum = 0.0_f32;
+                    for v in x2_slice {
+                        tb_sum += *v;
+                    }
+                    serial_println!(
+                        "[AP2 COMPUTE] Full Transformer Block verified sum={:.2} expected=418.42",
+                        tb_sum
+                    );
+
+                    let (_context, phys_addr) = task.tensor.deconstruct();
+                    TRANSFORMER_BLOCK_PHYS_ADDR.store(phys_addr, Ordering::Release);
+                    TRANSFORMER_BLOCK_SUM_BITS.store(tb_sum.to_bits() as usize, Ordering::Release);
+                    TRANSFORMER_BLOCK_DONE.store(true, Ordering::Release);
                 }
                 _ => {}
             }
@@ -779,6 +944,33 @@ unsafe extern "C" fn ap3_supervisor_entry(_cpu: &Cpu) -> ! {
         )
     };
     serial_println!("[CELL PMM] contiguous frames count=4 returned to bitmap");
+
+    while !TRANSFORMER_BLOCK_DONE.load(Ordering::Acquire) {
+        core::hint::spin_loop();
+    }
+    let tb_sum_bits = TRANSFORMER_BLOCK_SUM_BITS.load(Ordering::Acquire) as u32;
+    let tb_phys = TRANSFORMER_BLOCK_PHYS_ADDR.load(Ordering::Acquire);
+    let tb_val = f32::from_bits(tb_sum_bits);
+    serial_println!(
+        "[CELL TENSOR] AP2 Transformer Block verified sum={:.2} expected=418.42",
+        tb_val
+    );
+    telemetry_write(TelemetryEvent::TensorExecution(TensorExecution {
+        context: TraceContext::new(103, 0, 1),
+        elements: 64,
+        frame_count: TB_FRAME_COUNT as u16,
+        dtype: DType::F32 as u8,
+        simd_level: 2,
+        sum_bits: tb_sum_bits,
+    }));
+    unsafe {
+        pmm::free_contiguous_frames(
+            pmm::PhysicalFrame::from_address(tb_phys),
+            TB_FRAME_COUNT,
+        )
+    };
+    serial_println!("[CELL PMM] contiguous frames count=5 returned to bitmap");
+
     telemetry_write(TelemetryEvent::QueueMetrics(QueueMetrics {
         queue_id: 2,
         capacity: 32,

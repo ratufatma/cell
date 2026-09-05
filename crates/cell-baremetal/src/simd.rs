@@ -309,6 +309,13 @@ pub unsafe fn rmsnorm_64_avx(
     checksum
 }
 
+pub unsafe fn gemv_64x64_avx(x: *const f32, w: *const f32, out: *mut f32) {
+    for row in 0..64 {
+        let w_row = w.add(row * 64);
+        *out.add(row) = dot_product_64_avx(x, w_row);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
