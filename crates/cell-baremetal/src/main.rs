@@ -458,6 +458,9 @@ unsafe extern "C" fn ap2_compute_entry(_cpu: &Cpu) -> ! {
                 unsafe { simd::relu_avx(target, task.element_count as usize) };
                 serial_println!("[AP2 DISPATCH] Executed Op::ReLU (AVX-256)");
             }
+            TensorOp::Attention => {
+                serial_println!("[AP2 DISPATCH] Op::Attention pending KV-cache integration");
+            }
         }
 
         let c_ptr = base_ptr.add(task.out_offset as usize);

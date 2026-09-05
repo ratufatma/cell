@@ -172,6 +172,7 @@ pub struct TaskDescriptor {
 1. **`TensorOp::MatMul` (0x01):** Perkalian matriks $32 \times 32$ ($A \times B \to C$) menggunakan layout baris-utama (*row-major*). Setiap elemen $C_{i,j} = \sum_{k=0}^{31} (1.0 \times 2.0) = 64.0$.
 2. **`TensorOp::VectorAdd` (0x02):** Penjumlahan elemen vektor (injeksi bias). Bias sebesar $-14.0$ ditambahkan ke tiap elemen matriks $C$, menghasilkan nilai $50.0$.
 3. **`TensorOp::ReLU` (0x03):** Fungsi aktivasi non-linear *in-place*. Memotong nilai negatif $\max(0.0, x)$. Elemen $50.0$ tetap bernilai $50.0$.
+4. **`TensorOp::Attention` (0x04):** Scaled Dot-Product Attention untuk satu attention head ($d_k = 64$) terhadap $N \le 4$ token KV-cache. Formula: $\text{softmax}\left(\frac{Q \cdot K_i^T}{\sqrt{64}}\right) \cdot V_i$.
 4. **Verifikasi Reduksi Akhir:**
 
 $$\sum_{i=0}^{31} \sum_{j=0}^{31} C_{i,j} = 1.024 \times 50.0 = \mathbf{51.200,0}$$

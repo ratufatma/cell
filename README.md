@@ -147,10 +147,11 @@ menata layout: `[0..1024]` Matriks A (1.0), `[1024..2048]` Matriks B (2.0),
 dibungkus dalam `TaskDescriptor` (64-byte cache-aligned) yang berisi opcode
 `TensorOp`, pointer tensor, dan offset elemen untuk input/output.
 
-`cell-core` mendefinisikan tiga opcode via enum `TensorOp`:
+`cell-core` mendefinisikan empat opcode via enum `TensorOp`:
 - `MatMul` (0x01): C = A x B (32x32 F32, AVX-256)
 - `VectorAdd` (0x02): Out[i] = A[i] + B[i] (element-wise, AVX-256)
 - `ReLU` (0x03): X[i] = max(0.0, X[i]) (in-place, AVX-256)
+- `Attention` (0x04): softmax(Q·K_i^T / sqrt(64)) · V_i (AVX-256 dot product + Taylor softmax)
 
 Antrean `TENSOR_HOP1` dan `TENSOR_HOP2` mengalirkan `TaskDescriptor` (bukan
 `TensorChunk`). Core 2 (AP2 Compute) mengevaluasi opcode secara dinamis via
@@ -242,5 +243,23 @@ Operasi slot bersifat deterministik O(1) tanpa fragmentasi. Ketika blok penuh,
 panggil `append_block()` dengan blok PMM baru sebelum reserve berikutnya.
 
 ```sh
-cargo test -p cell-core  # 8 unit tests termasuk KV-Cache
+cargo test -p cell-core  # 14 unit tests termasuk KV-Cache + attention primitives
+```
+
+### Scaled Dot-Product Attention (AVX-256)
+
+Kernel attention diimplementasikan dalam tiga tahap:
+
+1. **Dot Product (AVX-256):** `dot_product_64_avx` menghitung Q · K_i untuk 64 elemen
+   menggunakan 8 iterasi `vmovups` + `vmulps` + `vaddps`, diikuti reduksi horizontal
+   via `vextractf128` + `vhaddps`.
+2. **Softmax (Taylor):** `softmax_4_stable` mencari max skor untuk stabilitas numerik,
+   menghitung exp(x) via Taylor series orde 4 ($1 + x + x^2/2 + x^3/6 + x^4/24$),
+   dan menormalisasi bobot. Untuk $x < -8.0$, exp langsung diset 0.0.
+3. **Weighted Value (AVX-256):** Bobot attention di-broadcast via `vbroadcastss`,
+   dikalikan dengan V_i menggunakan `vmulps`, dan diakumulasikan ke buffer output
+   menggunakan `vaddps`.
+
+```sh
+cargo test -p cell-core  # attention_two_token_checksum: verifikasi checksum ~162.909
 ```

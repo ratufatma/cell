@@ -6,7 +6,11 @@ pub mod tensor;
 
 use core::fmt;
 
-pub use kv_cache::{KvBlockDescriptor, SequenceContext, BLOCK_SIZE_BYTES, TOKENS_PER_BLOCK};
+pub use kv_cache::{
+    dot_product_64_scalar, KvBlockDescriptor, SequenceContext, ATTENTION_SCALE, BLOCK_SIZE_BYTES,
+    TOKENS_PER_BLOCK,
+};
+pub use kv_cache::softmax_4_stable;
 pub use task::{TaskDescriptor, TensorOp};
 pub use tensor::{DType, MutableState, Ready, TensorChunk, TensorShape};
 

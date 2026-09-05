@@ -7,6 +7,7 @@ pub enum TensorOp {
     MatMul = 0x01,
     VectorAdd = 0x02,
     ReLU = 0x03,
+    Attention = 0x04,
 }
 
 #[repr(C, align(64))]

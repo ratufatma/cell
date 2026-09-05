@@ -1,4 +1,5 @@
 use core::arch::asm;
+use cell_core::softmax_4_stable;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SimdLevel {
@@ -108,8 +109,51 @@ pub unsafe fn gemm_32x32_avx(a: *const f32, b: *const f32, c: *mut f32) {
                         out("ymm3") _,
                         options(nostack),
                     );
-                }
-            }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dot_product_64_avx_matches_scalar() {
+        let a = [0.25f32; 64];
+        let b = [1.0f32; 64];
+        let result = unsafe { dot_product_64_avx(a.as_ptr(), b.as_ptr()) };
+        let expected = cell_core::dot_product_64_scalar(&a, &b);
+        assert!(
+            (result - expected).abs() < 1e-4,
+            "avx={}, scalar={}",
+            result,
+            expected
+        );
+    }
+
+    #[test]
+    fn attention_two_token_checksum() {
+        let q = [0.25f32; 64];
+        let k0 = [1.0f32; 64];
+        let k1 = [0.5f32; 64];
+        let v0 = [2.0f32; 64];
+        let v1 = [4.0f32; 64];
+        let mut out = [0.0f32; 64];
+
+        let k_ptrs = [k0.as_ptr(), k1.as_ptr(), k0.as_ptr(), k0.as_ptr()];
+        let v_ptrs = [v0.as_ptr(), v1.as_ptr(), v0.as_ptr(), v0.as_ptr()];
+
+        unsafe {
+            attention_head_64_avx(q.as_ptr(), k_ptrs, v_ptrs, 2, out.as_mut_ptr());
+        }
+
+        let checksum: f32 = out.iter().sum();
+        assert!(
+            (checksum - 162.909).abs() < 0.01,
+            "checksum = {}, expected ~162.909 (Taylor exp)",
+            checksum
+        );
+    }
+}
         }
     }
 }
@@ -158,6 +202,104 @@ pub unsafe fn relu_avx(data: *mut f32, count: usize) {
                 out("ymm2") _,
                 options(nostack),
             );
+        }
+    }
+}
+
+/// Dot product of two 64-element f32 slices via AVX-256 inline assembly.
+///
+/// # Safety
+/// `a` and `b` must point to at least 64 valid f32 elements (256 bytes).
+#[inline(always)]
+pub unsafe fn dot_product_64_avx(a: *const f32, b: *const f32) -> f32 {
+    let sum: f32 = 0.0;
+    unsafe {
+        asm!(
+            "vxorps ymm0, ymm0, ymm0",
+            "xor {idx}, {idx}",
+            "2:",
+            "vmovups ymm1, [{a} + {idx}]",
+            "vmovups ymm2, [{b} + {idx}]",
+            "vmulps ymm1, ymm1, ymm2",
+            "vaddps ymm0, ymm0, ymm1",
+            "add {idx}, 32",
+            "cmp {idx}, 256",
+            "jl 2b",
+            "vextractf128 xmm1, ymm0, 1",
+            "vaddps xmm0, xmm0, xmm1",
+            "vhaddps xmm0, xmm0, xmm0",
+            "vhaddps xmm0, xmm0, xmm0",
+            "vmovss [{sum_ptr}], xmm0",
+            "vzeroupper",
+            a = in(reg) a,
+            b = in(reg) b,
+            idx = out(reg) _,
+            sum_ptr = in(reg) &sum as *const f32,
+            out("ymm0") _,
+            out("ymm1") _,
+            out("ymm2") _,
+            options(nostack),
+        );
+    }
+    sum
+}
+
+/// Scaled Dot-Product Attention for 1 head (dim 64) against N KV tokens.
+///
+/// Computes: out = softmax(Q · K_i / sqrt(64)) · V_i  for i in 0..N
+///
+/// # Safety
+/// - `q` must point to 64 valid f32 elements.
+/// - `k_ptrs[i]` and `v_ptrs[i]` must point to 64 valid f32 elements each.
+/// - `out` must point to 64 writable f32 elements.
+/// - `num_tokens` must be <= 4.
+/// - All pointers must be aligned to at least 4 bytes.
+pub unsafe fn attention_head_64_avx(
+    q: *const f32,
+    k_ptrs: [*const f32; 4],
+    v_ptrs: [*const f32; 4],
+    num_tokens: usize,
+    out: *mut f32,
+) {
+    const SCALE: f32 = 0.125;
+    let n = num_tokens.min(4);
+
+    for i in 0..64 {
+        *out.add(i) = 0.0;
+    }
+
+    let mut scores = [0.0f32; 4];
+    for i in 0..n {
+        let dot = dot_product_64_avx(q, k_ptrs[i]);
+        scores[i] = dot * SCALE;
+    }
+
+    let weights = softmax_4_stable(&scores, n);
+
+    for i in 0..n {
+        let w = weights[i];
+        if w == 0.0 {
+            continue;
+        }
+        for j in (0..64).step_by(8) {
+            unsafe {
+                asm!(
+                    "vbroadcastss ymm0, [{w_ptr}]",
+                    "vmovups ymm1, [{v}]",
+                    "vmulps ymm0, ymm0, ymm1",
+                    "vmovups ymm2, [{out}]",
+                    "vaddps ymm0, ymm0, ymm2",
+                    "vmovups [{out}], ymm0",
+                    "vzeroupper",
+                    w_ptr = in(reg) &w as *const f32,
+                    v = in(reg) v_ptrs[i].add(j),
+                    out = in(reg) out.add(j),
+                    out("ymm0") _,
+                    out("ymm1") _,
+                    out("ymm2") _,
+                    options(nostack),
+                );
+            }
         }
     }
 }

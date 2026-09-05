@@ -6,6 +6,49 @@ pub const ELEM_SIZE: usize = 4;
 pub const BYTES_PER_TOKEN: usize = 2 * NUM_HEADS * HEAD_DIM * ELEM_SIZE;
 pub const BLOCK_SIZE_BYTES: usize = TOKENS_PER_BLOCK * BYTES_PER_TOKEN;
 
+pub const ATTENTION_SCALE: f32 = 0.125;
+
+pub fn softmax_4_stable(scores: &[f32; 4], n: usize) -> [f32; 4] {
+    let mut weights = [0.0f32; 4];
+    if n == 0 {
+        return weights;
+    }
+
+    let mut max_val = scores[0];
+    for i in 1..n {
+        if scores[i] > max_val {
+            max_val = scores[i];
+        }
+    }
+
+    let mut sum_exp = 0.0f32;
+    for i in 0..n {
+        let x = scores[i] - max_val;
+        let e = if x < -8.0 {
+            0.0
+        } else {
+            1.0 + x * (1.0 + x * (0.5 + x * (1.0 / 6.0 + x / 24.0)))
+        };
+        weights[i] = e;
+        sum_exp += e;
+    }
+
+    if sum_exp > 0.0 {
+        for i in 0..n {
+            weights[i] /= sum_exp;
+        }
+    }
+    weights
+}
+
+pub fn dot_product_64_scalar(a: &[f32; 64], b: &[f32; 64]) -> f32 {
+    let mut sum = 0.0f32;
+    for i in 0..64 {
+        sum += a[i] * b[i];
+    }
+    sum
+}
+
 #[repr(C, align(64))]
 #[derive(Debug, Clone, Copy)]
 pub struct KvBlockDescriptor {
@@ -227,5 +270,77 @@ mod tests {
         assert!(v1_addr > v0_addr + BYTES_PER_TOKEN / 2);
         assert_ne!(k0_addr, v0_addr);
         assert_ne!(k1_addr, v1_addr);
+    }
+
+    #[test]
+    fn softmax_single_element_is_one() {
+        let scores = [3.0, 0.0, 0.0, 0.0];
+        let w = softmax_4_stable(&scores, 1);
+        assert!((w[0] - 1.0).abs() < 1e-6);
+        assert_eq!(w[1], 0.0);
+    }
+
+    #[test]
+    fn softmax_two_equal_scores_are_half() {
+        let scores = [1.0, 1.0, 0.0, 0.0];
+        let w = softmax_4_stable(&scores, 2);
+        assert!((w[0] - 0.5).abs() < 1e-5);
+        assert!((w[1] - 0.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn softmax_weights_sum_to_one() {
+        let scores = [2.0, 1.0, 0.5, 0.0];
+        let w = softmax_4_stable(&scores, 4);
+        let total: f32 = w.iter().sum();
+        assert!((total - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn softmax_zeroes_out_large_negative() {
+        let scores = [0.0, -20.0, -100.0, 0.0];
+        let w = softmax_4_stable(&scores, 4);
+        assert_eq!(w[2], 0.0);
+        let total: f32 = w.iter().sum();
+        assert!((total - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn dot_product_64_scalar_matches_hand() {
+        let a = [0.25f32; 64];
+        let b = [1.0f32; 64];
+        let result = dot_product_64_scalar(&a, &b);
+        assert!((result - 16.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn attention_two_token_checksum() {
+        let q = [0.25f32; 64];
+        let k0 = [1.0f32; 64];
+        let k1 = [0.5f32; 64];
+        let v0 = [2.0f32; 64];
+        let v1 = [4.0f32; 64];
+
+        let s0 = dot_product_64_scalar(&q, &k0) * ATTENTION_SCALE;
+        let s1 = dot_product_64_scalar(&q, &k1) * ATTENTION_SCALE;
+        assert!((s0 - 2.0).abs() < 1e-5);
+        assert!((s1 - 1.0).abs() < 1e-5);
+
+        let scores = [s0, s1, 0.0, 0.0];
+        let w = softmax_4_stable(&scores, 2);
+        let total_w: f32 = w[0] + w[1];
+        assert!((total_w - 1.0).abs() < 1e-5);
+
+        let mut out = [0.0f32; 64];
+        for j in 0..64 {
+            out[j] = w[0] * v0[j] + w[1] * v1[j];
+        }
+
+        let checksum: f32 = out.iter().sum();
+        assert!(
+            (checksum - 162.909).abs() < 0.01,
+            "checksum = {}, expected ~162.909 (Taylor exp)",
+            checksum
+        );
     }
 }
