@@ -58,7 +58,7 @@ pub enum PipelineMessage {
     },
 }
 
-static QUEUE_INGRESS_TO_W1: SpscQueue<RawPayload, 32> = SpscQueue::new();
+static QUEUE_INGRESS_TO_W1: SpscQueue<RawPayload, 8> = SpscQueue::new();
 static QUEUE_W1_TO_W2: SpscQueue<PipelineMessage, 32> = SpscQueue::new();
 static QUEUE_W2_TO_SUPERVISOR: SpscQueue<WorkResult, 32> = SpscQueue::new();
 static TENSOR_HOP1: SpscQueue<TaskDescriptor, 8> = SpscQueue::new();
@@ -244,7 +244,7 @@ pub extern "C" fn _start() -> ! {
         TraceContext::new(100, 100, 0),
         tensor_frame.address() as usize,
         tensor_virtual,
-        TensorShape::new_2d(32, 32),
+        TensorShape::new_1d(4096),
         DType::F32,
     );
     let one = 1.0_f32.to_ne_bytes();
@@ -252,16 +252,16 @@ pub extern "C" fn _start() -> ! {
     let zero = 0.0_f32.to_ne_bytes();
     let bias = (-14.0_f32).to_ne_bytes();
     let slice = tensor.as_mut_slice();
-    for bytes in slice[0..1024].chunks_exact_mut(size_of::<f32>()) {
+    for bytes in slice[0..4096].chunks_exact_mut(size_of::<f32>()) {
         bytes.copy_from_slice(&one);
     }
-    for bytes in slice[1024..2048].chunks_exact_mut(size_of::<f32>()) {
+    for bytes in slice[4096..8192].chunks_exact_mut(size_of::<f32>()) {
         bytes.copy_from_slice(&two);
     }
-    for bytes in slice[2048..3072].chunks_exact_mut(size_of::<f32>()) {
+    for bytes in slice[8192..12288].chunks_exact_mut(size_of::<f32>()) {
         bytes.copy_from_slice(&zero);
     }
-    for bytes in slice[3072..4096].chunks_exact_mut(size_of::<f32>()) {
+    for bytes in slice[12288..16384].chunks_exact_mut(size_of::<f32>()) {
         bytes.copy_from_slice(&bias);
     }
     let tensor = tensor.freeze();
@@ -315,20 +315,17 @@ pub extern "C" fn _start() -> ! {
 
     let mut pushed = 0_u32;
     let dropped = 0_u32;
-    for trace_id in 1..=PACKET_COUNT {
-        let context = TraceContext::new(trace_id as u64, trace_id as u64, 0);
-        let data = if trace_id == 4 { &[][..] } else { b"CELL data" };
-        let raw = RawPayload::new(context, data).unwrap_or_else(|_| halt());
 
+    for trace_id in 1..=PACKET_COUNT {
         while QUEUE_INGRESS_TO_W1.is_congested() {
             let pct = QUEUE_INGRESS_TO_W1.occupancy_pct();
             serial_println!(
-                "[CELL FLOW] Backpressure engaged on Q0->W1 (occupancy: {}%)",
+                "[CELL FLOW] High watermark reached ({}%) -> Backpressure active",
                 pct
             );
             telemetry_write(TelemetryEvent::QueueMetrics(QueueMetrics {
                 queue_id: 0,
-                capacity: 32,
+                capacity: 8,
                 pushed,
                 popped: 0,
                 dropped,
@@ -340,12 +337,12 @@ pub extern "C" fn _start() -> ! {
             }
             let pct = QUEUE_INGRESS_TO_W1.occupancy_pct();
             serial_println!(
-                "[CELL FLOW] Backpressure released (occupancy: {}%), resuming dispatch",
+                "[CELL FLOW] Low watermark reached ({}%) -> Backpressure released",
                 pct
             );
             telemetry_write(TelemetryEvent::QueueMetrics(QueueMetrics {
                 queue_id: 0,
-                capacity: 32,
+                capacity: 8,
                 pushed,
                 popped: 0,
                 dropped,
@@ -354,6 +351,9 @@ pub extern "C" fn _start() -> ! {
             }));
         }
 
+        let context = TraceContext::new(trace_id as u64, trace_id as u64, 0);
+        let data = if trace_id == 4 { &[][..] } else { b"CELL data" };
+        let raw = RawPayload::new(context, data).unwrap_or_else(|_| halt());
         while QUEUE_INGRESS_TO_W1.push(raw).is_err() {
             core::hint::spin_loop();
         }
