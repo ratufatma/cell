@@ -5,8 +5,8 @@ mod pmm;
 mod simd;
 
 use cell_core::{
-    DType, MutableState, RawPayload, TensorChunk, TensorShape, TraceContext, ValidatedPayload,
-    ValidatorCapability, WorkResult,
+    DType, MutableState, RawPayload, TaskDescriptor, TensorChunk, TensorOp, TensorShape,
+    TraceContext, ValidatedPayload, ValidatorCapability, WorkResult,
 };
 use cell_queue::SpscQueue;
 use cell_supervisor::telemetry::{
@@ -61,8 +61,8 @@ pub enum PipelineMessage {
 static QUEUE_INGRESS_TO_W1: SpscQueue<RawPayload, 32> = SpscQueue::new();
 static QUEUE_W1_TO_W2: SpscQueue<PipelineMessage, 32> = SpscQueue::new();
 static QUEUE_W2_TO_SUPERVISOR: SpscQueue<WorkResult, 32> = SpscQueue::new();
-static TENSOR_HOP1: SpscQueue<TensorChunk<cell_core::Ready>, 8> = SpscQueue::new();
-static TENSOR_HOP2: SpscQueue<TensorChunk<cell_core::Ready>, 8> = SpscQueue::new();
+static TENSOR_HOP1: SpscQueue<TaskDescriptor, 8> = SpscQueue::new();
+static TENSOR_HOP2: SpscQueue<TaskDescriptor, 8> = SpscQueue::new();
 static AP1_READY: AtomicBool = AtomicBool::new(false);
 static AP2_READY: AtomicBool = AtomicBool::new(false);
 static AP3_READY: AtomicBool = AtomicBool::new(false);
@@ -250,6 +250,7 @@ pub extern "C" fn _start() -> ! {
     let one = 1.0_f32.to_ne_bytes();
     let two = 2.0_f32.to_ne_bytes();
     let zero = 0.0_f32.to_ne_bytes();
+    let bias = (-14.0_f32).to_ne_bytes();
     let slice = tensor.as_mut_slice();
     for bytes in slice[0..1024].chunks_exact_mut(size_of::<f32>()) {
         bytes.copy_from_slice(&one);
@@ -257,18 +258,31 @@ pub extern "C" fn _start() -> ! {
     for bytes in slice[1024..2048].chunks_exact_mut(size_of::<f32>()) {
         bytes.copy_from_slice(&two);
     }
-    for bytes in slice[2048..4096].chunks_exact_mut(size_of::<f32>()) {
+    for bytes in slice[2048..3072].chunks_exact_mut(size_of::<f32>()) {
         bytes.copy_from_slice(&zero);
     }
+    for bytes in slice[3072..4096].chunks_exact_mut(size_of::<f32>()) {
+        bytes.copy_from_slice(&bias);
+    }
     let tensor = tensor.freeze();
+    let matmul_task = TaskDescriptor {
+        context: TraceContext::new(100, 100, 0),
+        op: TensorOp::MatMul,
+        tensor,
+        in_offset_a: 0,
+        in_offset_b: 1024,
+        out_offset: 2048,
+        element_count: 1024,
+        _reserved: [0; 15],
+    };
     serial_println!(
         "[CELL PMM] allocated contiguous frames count={} start_phys=0x{:x}",
         TENSOR_FRAME_COUNT,
-        tensor_frame.address()
+        matmul_task.tensor.phys_addr
     );
     serial_println!(
-        "[BSP TENSOR] Prepared MatMul 32x32 layout (A=1.0, B=2.0) at phys: 0x{:x}",
-        tensor_frame.address()
+        "[BSP TENSOR] Prepared MatMul 32x32 layout (A=1.0, B=2.0, Bias=-14.0) at phys: 0x{:x}",
+        matmul_task.tensor.phys_addr
     );
 
     let Some(response) = SMP_REQUEST.get_response() else {
@@ -308,7 +322,7 @@ pub extern "C" fn _start() -> ! {
         }
     }
 
-    if TENSOR_HOP1.push(tensor).is_err() {
+    if TENSOR_HOP1.push(matmul_task).is_err() {
         serial_println!("[CELL TENSOR] hop 1 queue unexpectedly full");
         halt();
     }
@@ -347,8 +361,8 @@ unsafe extern "C" fn ap1_worker_entry(_cpu: &Cpu) -> ! {
             core::hint::spin_loop();
         }
     }
-    if let Some(tensor) = wait_tensor(&TENSOR_HOP1) {
-        if TENSOR_HOP2.push(tensor).is_err() {
+    if let Some(task) = wait_task(&TENSOR_HOP1) {
+        if TENSOR_HOP2.push(task).is_err() {
             serial_println!("[AP1 ARBITER] tensor hop 2 queue unexpectedly full");
             halt();
         }
@@ -384,33 +398,60 @@ unsafe extern "C" fn ap2_compute_entry(_cpu: &Cpu) -> ! {
             core::hint::spin_loop();
         }
     }
-    if let Some(tensor) = wait_tensor(&TENSOR_HOP2) {
-        let sum = {
-            let raw_ptr = tensor.virt_ptr as *mut f32;
-            let a_ptr = raw_ptr;
-            let b_ptr = raw_ptr.add(1024);
-            let c_ptr = raw_ptr.add(2048);
-
-            unsafe { simd::gemm_32x32_avx(a_ptr, b_ptr, c_ptr) };
-
-            let c_slice = unsafe {
-                core::slice::from_raw_parts(c_ptr, 1024)
-            };
-            let c00 = c_slice[0];
-            let mut sum = 0.0_f32;
-            for value in c_slice {
-                sum += *value;
+    if let Some(task) = wait_task(&TENSOR_HOP2) {
+        let base_ptr = task.tensor.virt_ptr as *mut f32;
+        match task.op {
+            TensorOp::MatMul => {
+                let a_ptr = base_ptr.add(task.in_offset_a as usize);
+                let b_ptr = base_ptr.add(task.in_offset_b as usize);
+                let c_ptr = base_ptr.add(task.out_offset as usize);
+                unsafe { simd::gemm_32x32_avx(a_ptr, b_ptr, c_ptr) };
+                serial_println!("[AP2 DISPATCH] Executed Op::MatMul (32x32 AVX)");
             }
-            serial_println!(
-                "[AP2 COMPUTE] GEMM 32x32 AVX-256 complete: C[0,0]={} sum={} expected=65536",
-                c00,
-                sum
-            );
-            sum
-        };
-        let (_context, phys_addr) = tensor.deconstruct();
+            TensorOp::VectorAdd => {
+                let in1 = base_ptr.add(task.in_offset_a as usize);
+                let in2 = base_ptr.add(task.in_offset_b as usize);
+                let out = base_ptr.add(task.out_offset as usize);
+                unsafe { simd::vector_add_avx(in1, in2, out, task.element_count as usize) };
+                serial_println!("[AP2 DISPATCH] Executed Op::VectorAdd (AVX-256)");
+            }
+            TensorOp::ReLU => {
+                let target = base_ptr.add(task.out_offset as usize);
+                unsafe { simd::relu_avx(target, task.element_count as usize) };
+                serial_println!("[AP2 DISPATCH] Executed Op::ReLU (AVX-256)");
+            }
+        }
+
+        let c_ptr = base_ptr.add(task.out_offset as usize);
+        let c_slice = unsafe { core::slice::from_raw_parts(c_ptr, task.element_count as usize) };
+        let c00 = c_slice[0];
+
+        let bias_ptr = base_ptr.add(3072);
+        unsafe { simd::vector_add_avx(c_ptr, bias_ptr, c_ptr, task.element_count as usize) };
+        serial_println!("[AP2 DISPATCH] Chained VectorAdd bias=-14.0");
+
+        unsafe { simd::relu_avx(c_ptr, task.element_count as usize) };
+        serial_println!("[AP2 DISPATCH] Chained ReLU activation");
+
+        let final_slice = unsafe { core::slice::from_raw_parts(c_ptr, task.element_count as usize) };
+        let mut final_sum = 0.0_f32;
+        let mut nonzero = 0_u32;
+        for value in final_slice {
+            final_sum += *value;
+            if *value > 0.0 {
+                nonzero += 1;
+            }
+        }
+        serial_println!(
+            "[AP2 COMPUTE] Pipeline calculation checksum verified: sum={:.1} nonzero={} C[0,0]={:.1}",
+            final_sum,
+            nonzero,
+            c00
+        );
+
+        let (_context, phys_addr) = task.tensor.deconstruct();
         TENSOR_PHYS_ADDR.store(phys_addr, Ordering::Release);
-        TENSOR_SUM_BITS.store(sum.to_bits() as usize, Ordering::Release);
+        TENSOR_SUM_BITS.store(final_sum.to_bits() as usize, Ordering::Release);
         TENSOR_DONE.store(true, Ordering::Release);
         serial_println!(
             "[AP2 COMPUTE] Tensor descriptor forwarded phys=0x{:x}",
@@ -465,9 +506,10 @@ unsafe extern "C" fn ap3_supervisor_entry(_cpu: &Cpu) -> ! {
     }
     let tensor_sum_bits = TENSOR_SUM_BITS.load(Ordering::Acquire) as u32;
     let tensor_phys = TENSOR_PHYS_ADDR.load(Ordering::Acquire);
+    let final_val = f32::from_bits(tensor_sum_bits);
     serial_println!(
-        "[CELL TENSOR] AP2 GEMM reduction sum={} expected=65536",
-        f32::from_bits(tensor_sum_bits)
+        "[CELL TENSOR] AP2 GEMM+Bias+ReLU result sum={:.1} expected=32768",
+        final_val
     );
     telemetry_write(TelemetryEvent::TensorExecution(TensorExecution {
         context: TraceContext::new(100, 0, 1),
@@ -500,7 +542,7 @@ unsafe extern "C" fn ap3_supervisor_entry(_cpu: &Cpu) -> ! {
     halt()
 }
 
-fn wait_tensor<T>(queue: &SpscQueue<T, 8>) -> Option<T> {
+fn wait_task<T>(queue: &SpscQueue<T, 8>) -> Option<T> {
     loop {
         if let Some(value) = queue.pop() {
             return Some(value);

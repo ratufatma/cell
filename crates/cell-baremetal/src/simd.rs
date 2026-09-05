@@ -102,3 +102,31 @@ pub unsafe fn gemm_32x32_avx(a: *const f32, b: *const f32, c: *mut f32) {
         }
     }
 }
+
+/// Out[i] = A[i] + B[i] for N F32 elements (N must be a multiple of 8).
+///
+/// # Safety
+/// Pointers `a`, `b`, and `out` must be valid for `count` F32 elements.
+#[target_feature(enable = "avx")]
+pub unsafe fn vector_add_avx(a: *const f32, b: *const f32, out: *mut f32, count: usize) {
+    for i in (0..count).step_by(8) {
+        let va = _mm256_loadu_ps(a.add(i));
+        let vb = _mm256_loadu_ps(b.add(i));
+        let vres = _mm256_add_ps(va, vb);
+        _mm256_storeu_ps(out.add(i), vres);
+    }
+}
+
+/// Data[i] = max(0.0, Data[i]) for N F32 elements (N must be a multiple of 8).
+///
+/// # Safety
+/// Pointer `data` must be valid for `count` F32 elements.
+#[target_feature(enable = "avx")]
+pub unsafe fn relu_avx(data: *mut f32, count: usize) {
+    let zero = _mm256_setzero_ps();
+    for i in (0..count).step_by(8) {
+        let v = _mm256_loadu_ps(data.add(i));
+        let activated = _mm256_max_ps(v, zero);
+        _mm256_storeu_ps(data.add(i), activated);
+    }
+}

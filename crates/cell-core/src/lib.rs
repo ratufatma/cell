@@ -1,9 +1,11 @@
 #![no_std]
 
+pub mod task;
 pub mod tensor;
 
 use core::fmt;
 
+pub use task::{TaskDescriptor, TensorOp};
 pub use tensor::{DType, MutableState, Ready, TensorChunk, TensorShape};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

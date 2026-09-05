@@ -64,9 +64,9 @@ C0 BSP Ingress/Loader
 C1 AP1 Arbiter/Preprocessor
 	| QUEUE_W1_TO_W2 / TENSOR_HOP2
 	v
-C2 AP2 AVX Compute
-	| QUEUE_W2_TO_SUPERVISOR + tensor completion token
-	| (GEMM 32x32 AVX-256: C = A x B, verifikasi C[0,0]=64, sum=65536)
+C2 AP2 Dynamic Dispatch Engine
+	| match task.op { MatMul | VectorAdd | ReLU }
+	| Chained execution: ReLU((A x B) + Bias)
 	v
 C3 AP3 Supervisor/Telemetry/Egress
 ```
@@ -113,22 +113,37 @@ Validasi compile kernel tanpa boot QEMU:
 cargo check --target x86_64-unknown-none -p cell-baremetal
 ```
 
-### TensorChunk zero-copy antar-core
+### TaskDescriptor & Dynamic Dispatch
 
-BSP meminta HHDM offset Limine, mengalokasikan empat frame fisik kontigu dari
-PMM, lalu menata layout tensor 2D: matriks A (32x32, 1024 elemen F32 = 4 KiB)
-diisi `1.0`, matriks B (32x32) diisi `2.0`, matriks C (32x32) diisi `0.0`,
-dan 1024 elemen sisa sebagai padding. Descriptor `TensorChunk<Ready>` dikirim
-melalui `TENSOR_HOP1` ke AP1 lalu `TENSOR_HOP2` ke AP2 tanpa menyalin buffer.
+BSP mengalokasikan 4 frame kontigu dari PMM (16 KiB = 4096 elemen F32) dan
+menata layout: `[0..1024]` Matriks A (1.0), `[1024..2048]` Matriks B (2.0),
+`[2048..3072]` Akumulator C (0.0), `[3072..4096]` Bias (-14.0). Buffer ini
+dibungkus dalam `TaskDescriptor` (64-byte cache-aligned) yang berisi opcode
+`TensorOp`, pointer tensor, dan offset elemen untuk input/output.
 
-AP2 menjalankan kernel GEMM 32x32 AVX-256 (`C = A x B`), memverifikasi bahwa
-setiap elemen C[i,j] = 64.0 dan total reduksi = 65536.0, lalu meneruskan
-checksum ke AP3. AP3 memancarkan paket `TensorExecution` ke telemetri CELLTM
-dan mengembalikan empat frame ke PMM:
+`cell-core` mendefinisikan tiga opcode via enum `TensorOp`:
+- `MatMul` (0x01): C = A x B (32x32 F32, AVX-256)
+- `VectorAdd` (0x02): Out[i] = A[i] + B[i] (element-wise, AVX-256)
+- `ReLU` (0x03): X[i] = max(0.0, X[i]) (in-place, AVX-256)
+
+Antrean `TENSOR_HOP1` dan `TENSOR_HOP2` mengalirkan `TaskDescriptor` (bukan
+`TensorChunk`). Core 2 (AP2 Compute) mengevaluasi opcode secara dinamis via
+`match task.op`, sehingga satu compute engine dapat menjalankan berbagai jenis
+operasi tanpa perubahan kode statis.
+
+**Chained Layer Execution** mendemonstrasikan inferensi AI nyata:
+```
+Layer Output = ReLU((A x B) + Bias)
+```
+AP2 mengeksekusi berantai: MatMul (C = A x B, C[i,j] = 64.0) -> VectorAdd
+(C += -14.0, C[i,j] = 50.0) -> ReLU (tidak ada perubahan karena 50.0 > 0).
 
 ```text
-[BSP TENSOR] Prepared MatMul 32x32 layout (A=1.0, B=2.0) at phys: 0x53000
-[AP2 COMPUTE] GEMM 32x32 AVX-256 complete: C[0,0]=64 sum=65536 expected=65536
+[BSP TENSOR] Prepared MatMul 32x32 layout (A=1.0, B=2.0, Bias=-14.0) at phys: 0x53000
+[AP2 DISPATCH] Executed Op::MatMul (32x32 AVX)
+[AP2 DISPATCH] Chained VectorAdd bias=-14.0
+[AP2 DISPATCH] Chained ReLU activation
+[AP2 COMPUTE] Pipeline calculation checksum verified: sum=51200.0 nonzero=1024 C[0,0]=50.0
 [CELL PMM] contiguous frames count=4 returned to bitmap
 [CORE 3 SUPERVISOR] Pipeline 4-Core tuntas: 9 sukses, 1 terisolasi. Zero crash.
 ```
@@ -138,17 +153,14 @@ dan mengembalikan empat frame ke PMM:
 Modul `simd` mengaktifkan FPU/SSE/AVX secara independen pada BSP dan AP.
 Deteksi CPUID memeriksa XSAVE dan AVX, kemudian konfigurasi ring-0 menghapus
 CR0.EM/TS, mengaktifkan CR0.MP, CR4.OSFXSR/OSXMMEXCPT/OSXSAVE, dan XCR0
-bits x87+SSE+AVX (`0x7`). Kernel GEMM 32x32 AVX-256 menggunakan intrinsik
-`_mm256_set1_ps`, `_mm256_loadu_ps`, `_mm256_mul_ps`, `_mm256_add_ps`, dan
-`_mm256_storeu_ps` untuk menghitung perkalian matriks pada 8 float per register
-`ymm` secara paralel. Runner QEMU menggunakan `-cpu max -smp 4 -m 512M` agar
-capability AVX terlihat di semua core.
+bits x87+SSE+AVX (`0x7`). Pustaka intrinsik AVX-256 menyediakan empat kernel:
+- `gemm_32x32_avx`: perkalian matriks 32x32 F32 via `_mm256_set1_ps/mul_ps/add_ps`
+- `vector_add_avx`: element-wise addition via `_mm256_add_ps`
+- `relu_avx`: in-place ReLU activation via `_mm256_max_ps` dengan zero vector
+- `verify_avx`/`verify_sse`: probe vektor untuk validasi hardware SIMD
 
-```text
-[CELL SIMD] BSP initialized hardware vector engine: AVX (256-bit)
-[CELL SIMD] AP2 initialized hardware vector engine: AVX (256-bit)
-[AP2 COMPUTE] GEMM 32x32 AVX-256 complete: C[0,0]=64 sum=65536 expected=65536
-```
+Runner QEMU menggunakan `-cpu max -smp 4 -m 512M` agar capability AVX terlihat
+di semua core.
 
 ### Binary telemetry
 
