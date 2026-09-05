@@ -1,6 +1,10 @@
 #![no_std]
 
+pub mod tensor;
+
 use core::fmt;
+
+pub use tensor::{DType, MutableState, Ready, TensorChunk, TensorShape};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TraceContext {

@@ -4,7 +4,7 @@ CELL adalah fondasi kernel dataflow eksperimental berbasis Rust 2021. Modul berk
 
 ## Struktur
 
-- `cell-core`: crate `no_std` untuk `TraceContext`, typestate `RawPayload`/`ValidatedPayload`, `WorkResult`, dan `KernelModule`.
+- `cell-core`: crate `no_std` untuk `TraceContext`, typestate `RawPayload`/`ValidatedPayload`, `WorkResult`, `KernelModule`, serta primitive tensor zero-copy `TensorChunk`, `DType`, dan `TensorShape`.
 - `cell-queue`: crate `no_std` untuk ring buffer SPSC berbasis atomics, slot `MaybeUninit`, cache-line isolation, serta handle `Producer`/`Consumer`.
 - `cell-supervisor`: pencatat lineage berkapasitas tetap dan reset hook node.
 - `cell-baremetal`: kernel `no_std`/`no_main` x86_64 dengan boot protocol Limine, UART 16550 COM1, bitmap PMM 4 KiB/frame, pipeline SMP BSP-to-AP, dan completion loop AP-to-BSP.
