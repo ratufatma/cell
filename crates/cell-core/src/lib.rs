@@ -7,8 +7,8 @@ pub mod tensor;
 use core::fmt;
 
 pub use kv_cache::{
-    dot_product_64_scalar, KvBlockDescriptor, SequenceContext, ATTENTION_SCALE, BLOCK_SIZE_BYTES,
-    TOKENS_PER_BLOCK,
+    dot_product_64_scalar, rmsnorm_scalar, KvBlockDescriptor, SequenceContext, ATTENTION_SCALE,
+    BLOCK_SIZE_BYTES, RMSNORM_EPS, TOKENS_PER_BLOCK,
 };
 pub use kv_cache::softmax_4_stable;
 pub use task::{TaskDescriptor, TensorOp};

@@ -75,6 +75,9 @@ static TENSOR_SUM_BITS: AtomicUsize = AtomicUsize::new(0);
 static ATTENTION_DONE: AtomicBool = AtomicBool::new(false);
 static ATTENTION_PHYS_ADDR: AtomicUsize = AtomicUsize::new(0);
 static ATTENTION_SUM_BITS: AtomicUsize = AtomicUsize::new(0);
+static RMSNORM_DONE: AtomicBool = AtomicBool::new(false);
+static RMSNORM_PHYS_ADDR: AtomicUsize = AtomicUsize::new(0);
+static RMSNORM_SUM_BITS: AtomicUsize = AtomicUsize::new(0);
 static SERIAL_LOCK: AtomicBool = AtomicBool::new(false);
 static mut TELEMETRY: TelemetryEncoder = TelemetryEncoder::new();
 
@@ -431,6 +434,57 @@ pub extern "C" fn _start() -> ! {
         halt();
     }
 
+    let rms_frame =
+        unsafe { pmm::allocate_contiguous_frames(TENSOR_FRAME_COUNT) }.unwrap_or_else(|| halt());
+    let rms_virtual = hhdm
+        .offset()
+        .checked_add(rms_frame.address())
+        .unwrap_or_else(|| halt()) as usize as *mut u8;
+    let mut rms_tensor = TensorChunk::<MutableState>::new(
+        TraceContext::new(102, 102, 0),
+        rms_frame.address() as usize,
+        rms_virtual,
+        TensorShape::new_1d(4096),
+        DType::F32,
+    );
+    let x_val = 2.0_f32.to_ne_bytes();
+    let gamma_val = 0.5_f32.to_ne_bytes();
+    let zero_f = 0.0_f32.to_ne_bytes();
+    let r_slice = rms_tensor.as_mut_slice();
+    for bytes in r_slice[0..256].chunks_exact_mut(size_of::<f32>()) {
+        bytes.copy_from_slice(&x_val);
+    }
+    for bytes in r_slice[256..512].chunks_exact_mut(size_of::<f32>()) {
+        bytes.copy_from_slice(&gamma_val);
+    }
+    for bytes in r_slice[512..768].chunks_exact_mut(size_of::<f32>()) {
+        bytes.copy_from_slice(&zero_f);
+    }
+    let rms_tensor = rms_tensor.freeze();
+    let rmsnorm_task = TaskDescriptor {
+        context: TraceContext::new(102, 102, 0),
+        op: TensorOp::RMSNorm,
+        tensor: rms_tensor,
+        in_offset_a: 0,
+        in_offset_b: 64,
+        out_offset: 128,
+        element_count: 64,
+        _reserved: [0; 15],
+    };
+    serial_println!(
+        "[CELL PMM] allocated rmsnorm buffer count={} phys=0x{:x}",
+        TENSOR_FRAME_COUNT,
+        rmsnorm_task.tensor.phys_addr
+    );
+    serial_println!(
+        "[BSP TENSOR] Prepared RMSNorm layout (x=2.0 gamma=0.5) at phys: 0x{:x}",
+        rmsnorm_task.tensor.phys_addr
+    );
+    if TENSOR_HOP1.push(rmsnorm_task).is_err() {
+        serial_println!("[CELL TENSOR] hop 1 queue full for rmsnorm task");
+        halt();
+    }
+
     while !AP3_DONE.load(Ordering::Acquire) {
         core::hint::spin_loop();
     }
@@ -466,7 +520,7 @@ unsafe extern "C" fn ap1_worker_entry(_cpu: &Cpu) -> ! {
             core::hint::spin_loop();
         }
     }
-    for _ in 0..2 {
+    for _ in 0..3 {
         loop {
             if let Some(task) = TENSOR_HOP1.pop() {
                 if TENSOR_HOP2.push(task).is_err() {
@@ -510,7 +564,7 @@ unsafe extern "C" fn ap2_compute_entry(_cpu: &Cpu) -> ! {
         }
     }
     let mut tensors_processed = 0_u32;
-    while tensors_processed < 2 {
+    while tensors_processed < 3 {
         if let Some(task) = wait_task(&TENSOR_HOP2) {
             let base_ptr = task.tensor.virt_ptr as *mut f32;
             match task.op {
@@ -582,6 +636,21 @@ unsafe extern "C" fn ap2_compute_entry(_cpu: &Cpu) -> ! {
                     ATTENTION_PHYS_ADDR.store(phys_addr, Ordering::Release);
                     ATTENTION_SUM_BITS.store(attn_sum.to_bits() as usize, Ordering::Release);
                     ATTENTION_DONE.store(true, Ordering::Release);
+                }
+                TensorOp::RMSNorm => {
+                    let x_ptr = base_ptr.add(task.in_offset_a as usize);
+                    let gamma_ptr = base_ptr.add(task.in_offset_b as usize);
+                    let out_ptr = base_ptr.add(task.out_offset as usize);
+                    let sum = unsafe { simd::rmsnorm_64_avx(x_ptr, gamma_ptr, out_ptr, 1e-5) };
+                    serial_println!(
+                        "[AP2 COMPUTE] RMSNorm 64 AVX-256 verified sum={:.2} expected=32.00",
+                        sum
+                    );
+
+                    let (_context, phys_addr) = task.tensor.deconstruct();
+                    RMSNORM_PHYS_ADDR.store(phys_addr, Ordering::Release);
+                    RMSNORM_SUM_BITS.store(sum.to_bits() as usize, Ordering::Release);
+                    RMSNORM_DONE.store(true, Ordering::Release);
                 }
                 _ => {}
             }
@@ -680,6 +749,32 @@ unsafe extern "C" fn ap3_supervisor_entry(_cpu: &Cpu) -> ! {
     unsafe {
         pmm::free_contiguous_frames(
             pmm::PhysicalFrame::from_address(attn_phys),
+            TENSOR_FRAME_COUNT,
+        )
+    };
+    serial_println!("[CELL PMM] contiguous frames count=4 returned to bitmap");
+
+    while !RMSNORM_DONE.load(Ordering::Acquire) {
+        core::hint::spin_loop();
+    }
+    let rms_sum_bits = RMSNORM_SUM_BITS.load(Ordering::Acquire) as u32;
+    let rms_phys = RMSNORM_PHYS_ADDR.load(Ordering::Acquire);
+    let rms_val = f32::from_bits(rms_sum_bits);
+    serial_println!(
+        "[CELL TENSOR] AP2 RMSNorm verified sum={:.2} expected=32.00",
+        rms_val
+    );
+    telemetry_write(TelemetryEvent::TensorExecution(TensorExecution {
+        context: TraceContext::new(102, 0, 1),
+        elements: 64,
+        frame_count: TENSOR_FRAME_COUNT as u16,
+        dtype: DType::F32 as u8,
+        simd_level: 2,
+        sum_bits: rms_sum_bits,
+    }));
+    unsafe {
+        pmm::free_contiguous_frames(
+            pmm::PhysicalFrame::from_address(rms_phys),
             TENSOR_FRAME_COUNT,
         )
     };

@@ -49,6 +49,29 @@ pub fn dot_product_64_scalar(a: &[f32; 64], b: &[f32; 64]) -> f32 {
     sum
 }
 
+pub const RMSNORM_EPS: f32 = 1e-5;
+
+pub fn rmsnorm_scalar(x: &[f32; 64], gamma: &[f32; 64], out: &mut [f32; 64]) -> f32 {
+    let mut sum_sq = 0.0f32;
+    for i in 0..64 {
+        sum_sq += x[i] * x[i];
+    }
+    let mean_sq = sum_sq / 64.0;
+    let val = mean_sq + RMSNORM_EPS;
+    let mut guess = val * 0.5;
+    for _ in 0..8 {
+        guess = (guess + val / guess) * 0.5;
+    }
+    let rms = guess;
+    let inv_rms = 1.0 / rms;
+    let mut total = 0.0f32;
+    for i in 0..64 {
+        out[i] = (x[i] * inv_rms) * gamma[i];
+        total += out[i];
+    }
+    total
+}
+
 #[repr(C, align(64))]
 #[derive(Debug, Clone, Copy)]
 pub struct KvBlockDescriptor {
@@ -342,5 +365,26 @@ mod tests {
             "checksum = {}, expected ~162.909 (Taylor exp)",
             checksum
         );
+    }
+
+    #[test]
+    fn rmsnorm_uniform_input_checksum() {
+        let x = [2.0f32; 64];
+        let gamma = [0.5f32; 64];
+        let mut out = [0.0f32; 64];
+        let sum = rmsnorm_scalar(&x, &gamma, &mut out);
+        assert!(
+            (sum - 32.0).abs() < 0.001,
+            "rmsnorm sum = {}, expected ~32.0",
+            sum
+        );
+        for i in 0..64 {
+            assert!(
+                (out[i] - 0.5).abs() < 0.001,
+                "out[{}] = {}, expected ~0.5",
+                i,
+                out[i]
+            );
+        }
     }
 }

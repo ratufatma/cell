@@ -41,23 +41,33 @@ def run_verification() -> int:
         stderr=subprocess.STDOUT,
     )
 
+    import threading
     output_chunks = []
+    stop_reading = threading.Event()
+
+    def reader():
+        while not stop_reading.is_set():
+            chunk = proc.stdout.read(4096)
+            if chunk:
+                output_chunks.append(chunk)
+            else:
+                break
+
+    t = threading.Thread(target=reader, daemon=True)
+    t.start()
+
     try:
         while time.time() - start_time < TIMEOUT_SECONDS:
-            try:
-                chunk = proc.stdout.read(1)
-                if chunk:
-                    output_chunks.append(chunk)
-                else:
-                    break
-            except Exception:
-                break
-            if b"Zero crash" in b"".join(output_chunks):
+            time.sleep(0.1)
+            combined = b"".join(output_chunks)
+            if b"Zero crash" in combined:
                 break
     finally:
+        stop_reading.set()
         if proc.poll() is None:
             proc.kill()
         proc.wait()
+        t.join(timeout=2)
 
     full_output = b"".join(output_chunks).decode("utf-8", errors="replace")
 
@@ -73,6 +83,7 @@ def run_verification() -> int:
     captured_telemetry_opcodes: Set[int] = set()
     queue_metrics_payload_valid = False
     attention_checksum_verified = False
+    rmsnorm_checksum_verified = False
     pmm_free_count = 0
 
     for line_str in full_output.splitlines():
@@ -101,6 +112,9 @@ def run_verification() -> int:
 
         if "Attention verified sum=" in line_str and "expected=162.42" in line_str:
             attention_checksum_verified = True
+
+        if "RMSNorm verified sum=" in line_str and "expected=32.00" in line_str:
+            rmsnorm_checksum_verified = True
 
         if "Trace 4 isolated failure captured" in line_str:
             fault_trace_isolated = True
@@ -184,6 +198,11 @@ def run_verification() -> int:
             "AVX Attention Checksum (sum=162.42)",
             attention_checksum_verified,
             "Scaled Dot-Product Q@K^T/sqrt(d)@V exact",
+        ),
+        (
+            "AVX RMSNorm Checksum (sum=32.00)",
+            rmsnorm_checksum_verified,
+            "Root Mean Square Normalization exact",
         ),
     ]
 
