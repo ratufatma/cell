@@ -7,7 +7,7 @@ CELL adalah fondasi kernel dataflow eksperimental berbasis Rust 2021. Modul berk
 - `cell-core`: crate `no_std` untuk `TraceContext`, typestate `RawPayload`/`ValidatedPayload`, `WorkResult`, dan `KernelModule`.
 - `cell-queue`: crate `no_std` untuk ring buffer SPSC berbasis atomics, slot `MaybeUninit`, cache-line isolation, serta handle `Producer`/`Consumer`.
 - `cell-supervisor`: pencatat lineage berkapasitas tetap dan reset hook node.
-- `cell-baremetal`: kernel `no_std`/`no_main` x86_64 dengan boot protocol Limine, UART 16550 COM1, pipeline SMP BSP-to-AP, dan completion loop AP-to-BSP.
+- `cell-baremetal`: kernel `no_std`/`no_main` x86_64 dengan boot protocol Limine, UART 16550 COM1, bitmap PMM 4 KiB/frame, pipeline SMP BSP-to-AP, dan completion loop AP-to-BSP.
 - `tests/simulation_harness`: simulasi ingress, validator, worker, dan fault injection.
 
 ## Menjalankan
@@ -73,6 +73,16 @@ menghentikan pemrosesan trace lain:
 [SUPERVISOR] Trace 10 OK
 [CELL KERNEL] Batch completed: 9 succeeded, 1 isolated failure. Zero crash.
 ```
+
+### Physical Memory Manager
+
+Kernel meminta `MemoryMapRequest` dari Limine dan membangun bitmap allocator
+untuk frame 4 KiB pada region `USABLE` saja. Semua region lain tetap dianggap
+teralokasi atau reserved. Implementasi PoC membatasi bitmap pada physical
+address di bawah 4 GiB, tidak memakai heap, dan menyediakan operasi deterministic
+allocate/free yang hanya dipanggil BSP pada tahap ini. Saat boot, kernel mencetak
+statistik frame usable/free dan melakukan probe allocate lalu free untuk
+memverifikasi bahwa frame kembali ke bitmap.
 
 Validasi compile kernel tanpa boot QEMU:
 

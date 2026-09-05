@@ -1,6 +1,8 @@
 #![no_std]
 #![no_main]
 
+mod pmm;
+
 use cell_core::{RawPayload, TraceContext, ValidatorCapability, WorkResult};
 use cell_queue::SpscQueue;
 use cell_supervisor::Supervisor;
@@ -8,7 +10,7 @@ use core::arch::asm;
 use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use limine::mp::Cpu;
-use limine::request::{RequestsEndMarker, RequestsStartMarker};
+use limine::request::{MemoryMapRequest, RequestsEndMarker, RequestsStartMarker};
 use limine::BaseRevision;
 
 #[used]
@@ -23,6 +25,10 @@ static BASE_REVISION: BaseRevision = BaseRevision::new();
 #[link_section = ".limine_requests"]
 #[allow(deprecated)]
 static SMP_REQUEST: limine::request::SmpRequest = limine::request::SmpRequest::new();
+
+#[used]
+#[link_section = ".limine_requests"]
+static MEMMAP_REQUEST: MemoryMapRequest = MemoryMapRequest::new();
 
 #[used]
 #[link_section = ".requests_end_marker"]
@@ -121,6 +127,32 @@ fn serial_write(arguments: fmt::Arguments<'_>) {
 pub extern "C" fn _start() -> ! {
     unsafe { (&*core::ptr::addr_of!(SERIAL)).init() };
     serial_println!("[CELL KERNEL] Dataflow pipeline active");
+
+    let Some(memory_map) = MEMMAP_REQUEST.get_response() else {
+        serial_println!("[CELL PMM] no Limine memory map response");
+        halt();
+    };
+    let pmm_stats = unsafe { pmm::initialize(memory_map.entries()) };
+    serial_println!(
+        "[CELL PMM] usable={} free={} max_frame={}",
+        pmm_stats.usable_frames,
+        pmm_stats.free_frames,
+        pmm_stats.max_frame
+    );
+    let Some(probe_frame) = (unsafe { pmm::allocate_frame() }) else {
+        serial_println!("[CELL PMM] allocation probe failed");
+        halt();
+    };
+    serial_println!(
+        "[CELL PMM] allocated frame={} physical=0x{:x}",
+        probe_frame.number(),
+        probe_frame.address()
+    );
+    if !unsafe { pmm::free_frame(probe_frame) } {
+        serial_println!("[CELL PMM] deallocation probe failed");
+        halt();
+    }
+    serial_println!("[CELL PMM] frame returned to bitmap");
 
     let Some(response) = SMP_REQUEST.get_response() else {
         serial_println!("[CELL SMP] no Limine SMP response");
