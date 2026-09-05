@@ -9,7 +9,7 @@ CELL adalah sistem operasi *bare-metal* berbasis Rust (`#![no_std]`) yang diranc
 ### A. Target Kompilasi & Lingkungan Mesin
 * **Target Triplet:** `x86_64-unknown-none`
 * **Bootloader:** Limine Boot Protocol (Higher-Half Direct Map / HHDM & Limine SMP Request)
-* **Runner Virtualisasi:** QEMU emulator (`-cpu max -smp 4 -m 512M`) dengan dukungan akselerasi host KVM (`-enable-kvm -cpu host`)
+* **Runner Virtualisasi:** QEMU emulator dengan deteksi otomatis KVM (`-enable-kvm -cpu host` jika tersedia) atau fallback TCG (`-cpu max`). Set `CELL_FORCE_TCG=1` untuk memaksa mode TCG.
 * **Saluran I/O:** Serial UART 16550 COM1 (`0x3F8`) beroperasi pada baudrate 115200 8N1 dengan serial spinlock minimal.
 
 ### B. Inisialisasi Register Kontrol CPU (FPU, SSE, AVX)
@@ -256,7 +256,7 @@ Untuk mengeliminasi parsing teks bebas (*regex string parsing*) pada agen AI, CE
 
 ## 8. Verifikasi CI/CD & Invarian Sistem
 
-Skrip otomatis `scripts/verify_run.py` menjalankan pengujian end-to-end pada lingkungan virtualisasi QEMU. Build dinyatakan lolos jika dan hanya jika **10 dari 10 asersi** terpenuhi secara simultan:
+Skrip otomatis `scripts/verify_run.py` menjalankan pengujian end-to-end pada lingkungan virtualisasi QEMU. Build dinyatakan lolos jika dan hanya jika **13 dari 13 asersi** terpenuhi secara simultan:
 
 1. **SMP 4-Core Bootstrap:** Core 0, 1, 2, dan 3 berhasil online dan melaporkan kesiapan ke Limine.
 2. **Flow Control Throttling (HWM Engage):** Ingress mendeteksi antrean $\ge 75\%$ dan menahan pemompaan data.
@@ -268,3 +268,6 @@ Skrip otomatis `scripts/verify_run.py` menjalankan pengujian end-to-end pada lin
 8. **Supervisor Zero-Crash Guarantee:** Laporan akhir supervisor menunjukkan $9$ sukses, $1$ terisolasi, $0$ crash.
 9. **CELLTM Telemetry Stream Coverage:** Seluruh jenis opcode event biner terdeteksi dalam aliran serial UART.
 10. **20-Byte QueueMetrics Wire Format:** Format telemetri antrean memuat status `watermark_state` sesuai spesifikasi bitwise.
+11. **AVX Attention Checksum (sum=162.42):** Scaled Dot-Product $Q@K^T/\sqrt{d_k}@V$ menghasilkan checksum tepat.
+12. **AVX RMSNorm Checksum (sum=32.00):** Root Mean Square Normalization menghasilkan checksum tepat.
+13. **Full Transformer Block Checksum (sum=418.42):** Rangkaian lengkap Norm→Attn→Res→Norm→FFN→Res menghasilkan checksum tepat.

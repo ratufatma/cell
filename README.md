@@ -51,7 +51,10 @@ dan AP3. Masing-masing core menjadi operator dataflow terpisah:
 [CELL PIPELINE] 4-Core topology active: C0 -> C1 -> C2 -> C3
 ```
 
-Runner menggunakan `qemu-system-x86_64 -cpu max -smp 4 -m 512M`; lock hanya
+Runner menggunakan `qemu-system-x86_64 -smp 4 -m 512M` dengan deteksi otomatis
+akselerasi KVM. Jika `/dev/kvm` tersedia, runner mengaktifkan `-enable-kvm -cpu host`;
+jika tidak (container/VM), fallback ke TCG `-cpu max` dengan AVX-256 emulation.
+Set `CELL_FORCE_TCG=1` untuk memaksa mode TCG meskipun KVM tersedia. Lock hanya
 melindungi output UART agar karakter antar-core tidak bercampur. Jalur data
 antar-core tetap menggunakan queue SPSC tanpa global lock.
 
@@ -186,8 +189,10 @@ bits x87+SSE+AVX (`0x7`). Pustaka intrinsik AVX-256 menyediakan empat kernel:
 - `relu_avx`: in-place ReLU activation via `_mm256_max_ps` dengan zero vector
 - `verify_avx`/`verify_sse`: probe vektor untuk validasi hardware SIMD
 
-Runner QEMU menggunakan `-cpu max -smp 4 -m 512M` agar capability AVX terlihat
-di semua core.
+Runner QEMU mendeteksi `/dev/kvm` secara otomatis: mode KVM (`-cpu host`)
+mempercepat eksekusi di host fisik, sementara fallback TCG (`-cpu max`) tetap
+mengekspos AVX-256 di semua core untuk container/VM. Set `CELL_FORCE_TCG=1`
+untuk memaksa TCG.
 
 ### Binary telemetry
 

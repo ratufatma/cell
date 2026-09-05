@@ -51,4 +51,25 @@ xorriso -as mkisofs -b boot/limine/limine-bios-cd.bin \
     -partition_offset 16 --protective-msdos-label "${ISO_DIR}" \
     -o "${ISO_PATH}"
 "${TOOLS_DIR}/limine" bios-install "${ISO_PATH}"
-exec qemu-system-x86_64 -cpu max -cdrom "${ISO_PATH}" -serial stdio -display none -smp 4 -m 512M
+# 5. Deteksi Akselerasi KVM vs Fallback TCG
+QEMU_ACCEL_ARGS=()
+if [ "${CELL_FORCE_TCG:-0}" != "1" ] && [ -e /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+    echo "[RUNNER] /dev/kvm detected and accessible. Hardware acceleration enabled." >&2
+    QEMU_ACCEL_ARGS=("-enable-kvm" "-cpu" "host")
+else
+    if [ "${CELL_FORCE_TCG:-0}" == "1" ]; then
+        echo "[RUNNER] CELL_FORCE_TCG=1 set. Forcing software emulation (TCG)." >&2
+    else
+        echo "[RUNNER] /dev/kvm not available or inaccessible. Falling back to software emulation (TCG)." >&2
+    fi
+    QEMU_ACCEL_ARGS=("-cpu" "max")
+fi
+
+# 6. Eksekusi QEMU 4-Core SMP
+exec qemu-system-x86_64 \
+    "${QEMU_ACCEL_ARGS[@]}" \
+    -smp 4 \
+    -m 512M \
+    -cdrom "${ISO_PATH}" \
+    -serial stdio \
+    -display none
