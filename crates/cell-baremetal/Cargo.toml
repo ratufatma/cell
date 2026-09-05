@@ -1,0 +1,16 @@
+[package]
+name = "cell-baremetal"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+cell-core = { path = "../cell-core" }
+cell-queue = { path = "../cell-queue" }
+cell-supervisor = { path = "../cell-supervisor" }
+limine = "0.5.0"
+
+[[bin]]
+name = "cell-baremetal"
+path = "src/main.rs"
+test = false
+bench = false

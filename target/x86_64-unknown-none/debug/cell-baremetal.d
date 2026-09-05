@@ -1,0 +1,1 @@
+/mnt/HDD/cell/target/x86_64-unknown-none/debug/cell-baremetal: /mnt/HDD/cell/crates/cell-baremetal/src/main.rs /mnt/HDD/cell/crates/cell-core/src/lib.rs /mnt/HDD/cell/crates/cell-queue/src/lib.rs /mnt/HDD/cell/crates/cell-supervisor/src/lib.rs
