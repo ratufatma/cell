@@ -91,6 +91,28 @@ impl<T, const CAP: usize> SpscQueue<T, CAP> {
         let tail = self.tail.0.load(Ordering::Acquire);
         head.wrapping_sub(tail) == CAP
     }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        let head = self.head.0.load(Ordering::Relaxed);
+        let tail = self.tail.0.load(Ordering::Acquire);
+        head.wrapping_sub(tail)
+    }
+
+    #[inline]
+    pub fn occupancy_pct(&self) -> usize {
+        (self.len() * 100) / CAP
+    }
+
+    #[inline]
+    pub fn is_congested(&self) -> bool {
+        self.occupancy_pct() >= 75
+    }
+
+    #[inline]
+    pub fn is_drained(&self) -> bool {
+        self.occupancy_pct() <= 25
+    }
 }
 
 impl<T, const CAP: usize> Producer<'_, T, CAP> {
@@ -118,5 +140,43 @@ impl<T, const CAP: usize> Default for SpscQueue<T, CAP> {
 impl<T, const CAP: usize> Drop for SpscQueue<T, CAP> {
     fn drop(&mut self) {
         while self.pop().is_some() {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn len_and_occupancy_are_deterministic() {
+        let q = SpscQueue::<u32, 8>::new();
+        assert_eq!(q.len(), 0);
+        assert_eq!(q.occupancy_pct(), 0);
+        q.push(1).unwrap();
+        q.push(2).unwrap();
+        q.push(3).unwrap();
+        assert_eq!(q.len(), 3);
+        assert_eq!(q.occupancy_pct(), 37);
+        q.pop();
+        q.pop();
+        assert_eq!(q.len(), 1);
+        assert_eq!(q.occupancy_pct(), 12);
+    }
+
+    #[test]
+    fn congestion_flag_toggles_at_watermarks() {
+        let q = SpscQueue::<u32, 8>::new();
+        assert!(!q.is_congested());
+        assert!(q.is_drained());
+        for i in 0..6 {
+            q.push(i).unwrap();
+        }
+        assert!(q.is_congested());
+        assert!(!q.is_drained());
+        while q.len() > 1 {
+            q.pop();
+        }
+        assert!(!q.is_congested());
+        assert!(q.is_drained());
     }
 }

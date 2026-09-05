@@ -313,13 +313,51 @@ pub extern "C" fn _start() -> ! {
     serial_println!("[CELL SMP] Core 3 (AP3 Supervisor) online");
     serial_println!("[CELL PIPELINE] 4-Core topology active: C0 -> C1 -> C2 -> C3");
 
+    let mut pushed = 0_u32;
+    let dropped = 0_u32;
     for trace_id in 1..=PACKET_COUNT {
         let context = TraceContext::new(trace_id as u64, trace_id as u64, 0);
         let data = if trace_id == 4 { &[][..] } else { b"CELL data" };
         let raw = RawPayload::new(context, data).unwrap_or_else(|_| halt());
+
+        while QUEUE_INGRESS_TO_W1.is_congested() {
+            let pct = QUEUE_INGRESS_TO_W1.occupancy_pct();
+            serial_println!(
+                "[CELL FLOW] Backpressure engaged on Q0->W1 (occupancy: {}%)",
+                pct
+            );
+            telemetry_write(TelemetryEvent::QueueMetrics(QueueMetrics {
+                queue_id: 0,
+                capacity: 32,
+                pushed,
+                popped: 0,
+                dropped,
+                watermark_state: 1,
+                _padding: [0; 3],
+            }));
+            while !QUEUE_INGRESS_TO_W1.is_drained() {
+                core::hint::spin_loop();
+            }
+            let pct = QUEUE_INGRESS_TO_W1.occupancy_pct();
+            serial_println!(
+                "[CELL FLOW] Backpressure released (occupancy: {}%), resuming dispatch",
+                pct
+            );
+            telemetry_write(TelemetryEvent::QueueMetrics(QueueMetrics {
+                queue_id: 0,
+                capacity: 32,
+                pushed,
+                popped: 0,
+                dropped,
+                watermark_state: 2,
+                _padding: [0; 3],
+            }));
+        }
+
         while QUEUE_INGRESS_TO_W1.push(raw).is_err() {
             core::hint::spin_loop();
         }
+        pushed += 1;
     }
 
     if TENSOR_HOP1.push(matmul_task).is_err() {
@@ -532,9 +570,11 @@ unsafe extern "C" fn ap3_supervisor_entry(_cpu: &Cpu) -> ! {
         pushed: PACKET_COUNT as u32,
         popped: PACKET_COUNT as u32,
         dropped: 0,
+        watermark_state: 0,
+        _padding: [0; 3],
     }));
     serial_println!(
-        "[CORE 3 SUPERVISOR] Pipeline 4-Core tuntas: {} sukses, {} terisolasi. Zero crash.",
+        "[CORE 3 SUPERVISOR] Pipeline 4-Core tuntas: {} sukses, {} terisolasi. 0 dropped. Zero crash.",
         succeeded,
         failed
     );

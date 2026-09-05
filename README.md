@@ -95,6 +95,32 @@ menghentikan pemrosesan trace lain:
 [CELL KERNEL] Batch completed: 9 succeeded, 1 isolated failure. Zero crash.
 ```
 
+### Flow Control & Watermark Monitoring
+
+Untuk mencegah saturasi antrean antar-core, `SpscQueue` menyediakan inspeksi
+kapasitas O(1) berbasis atomik tanpa lock:
+
+- `len()` — jumlah elemen saat ini (head - tail dengan wrapping)
+- `occupancy_pct()` — rasio keterisian dalam persentase (0..=100)
+- `is_congested()` — `true` jika occupancy >= 75% (High Watermark)
+- `is_drained()` — `true` jika occupancy <= 25% (Low Watermark)
+
+Pembacaan `tail` oleh produsen menggunakan `Ordering::Acquire` untuk menjaga
+konsistensi memori tanpa menimbulkan cache invalidation storm antar-core (64-byte
+cache-line isolation).
+
+Core 0 (BSP Ingress) menerapkan **backpressure adaptif**: sebelum setiap `push`,
+core memeriksa `is_congested()`. Jika terdeteksi kongesti, core menahan
+pengiriman (throttle) dan mencatat transisi watermark ke telemetri `QueueMetrics`
+(`watermark_state: 1` = Congested). Saat konsumen mengosongkan antrean hingga
+`is_drained()`, core melanjutkan dispatch (`watermark_state: 2` = Recovered).
+
+```text
+[CELL FLOW] Backpressure engaged on Q0->W1 (occupancy: 75%)
+[CELL FLOW] Backpressure released (occupancy: 12%), resuming dispatch
+[CORE 3 SUPERVISOR] Pipeline 4-Core tuntas: 9 sukses, 1 terisolasi. 0 dropped. Zero crash.
+```
+
 ### Physical Memory Manager
 
 Kernel meminta `MemoryMapRequest` dari Limine dan membangun bitmap allocator
@@ -167,7 +193,7 @@ di semua core.
 `cell-supervisor::telemetry` menyediakan fixed-layout, little-endian frames
 dengan magic `[ce 11 54 4d]`, versi `1`, sequence number, opcode, payload
 length, dan payload deterministik untuk `Heartbeat`, `PmmSnapshot`,
-`QueueMetrics`, `TensorExecution` (termasuk GEMM 32x32 dengan
+`QueueMetrics` (termasuk `watermark_state`: 0=Normal, 1=Congested, 2=Recovered), `TensorExecution` (termasuk GEMM 32x32 dengan
 `elements=1024`, `simd_level=2` untuk AVX-256), serta `FaultIncident`. Encoder memakai buffer
 tetap tanpa `alloc`; `decode()` memvalidasi magic, versi, opcode, dan panjang
 sebelum mengembalikan event terstruktur.

@@ -67,6 +67,8 @@ pub struct QueueMetrics {
     pub pushed: u32,
     pub popped: u32,
     pub dropped: u32,
+    pub watermark_state: u8,
+    pub _padding: [u8; 3],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,7 +150,8 @@ impl TelemetryEncoder {
                 put_u32(&mut frame.bytes, HEADER_SIZE + 4, value.pushed);
                 put_u32(&mut frame.bytes, HEADER_SIZE + 8, value.popped);
                 put_u32(&mut frame.bytes, HEADER_SIZE + 12, value.dropped);
-                (TelemetryType::QueueMetrics, 16)
+                frame.bytes[HEADER_SIZE + 16] = value.watermark_state;
+                (TelemetryType::QueueMetrics, 20)
             }
             TelemetryEvent::TensorExecution(value) => {
                 put_context(&mut frame.bytes, HEADER_SIZE, value.context);
@@ -217,13 +220,15 @@ pub fn decode(bytes: &[u8]) -> Result<(u32, DecodedTelemetry), TelemetryError> {
                 largest_free_run: read_u64(payload, 16),
             })
         }
-        TelemetryType::QueueMetrics if payload_len == 16 => {
+        TelemetryType::QueueMetrics if payload_len == 20 => {
             DecodedTelemetry::QueueMetrics(QueueMetrics {
                 queue_id: read_u16(payload, 0),
                 capacity: read_u16(payload, 2),
                 pushed: read_u32(payload, 4),
                 popped: read_u32(payload, 8),
                 dropped: read_u32(payload, 12),
+                watermark_state: payload[16],
+                _padding: [0; 3],
             })
         }
         TelemetryType::TensorExecution if payload_len == 30 => {
