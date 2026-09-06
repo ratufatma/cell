@@ -7,6 +7,7 @@ Format:
   Header (64 bytes): Magic(8) + Version(2) + Reserved(6) + DataLen(4) + Checksum(4) + Pad(40)
   Payload (N floats): gamma1(512) + K0(512) + K1(512) + V0(512) + V1(512) + gamma2(512) + bias(512)
                       + W_ffn(512x512) + K2(512) + V2(512) + K3(512) + V3(512)
+                      + W_unembed(256x512)
 """
 
 import struct
@@ -20,9 +21,13 @@ HEADER_SIZE = 64
 HIDDEN_DIM = 512
 NUM_HEADS = 8
 HEAD_DIM = 64
+VOCAB_SIZE = 256
 PARAM_VECTOR = 7 * HIDDEN_DIM
 WFFN_FLOATS = HIDDEN_DIM * HIDDEN_DIM
 KV_TOKEN_FLOATS = 4 * HIDDEN_DIM
+UNEMBED_BASE = 1.0 / 512.0
+UNEMBED_TARGET_ROW = 67
+UNEMBED_TARGET_BOOST = 2.0 / 512.0
 
 
 def generate_weights_bin(output_path: str):
@@ -39,7 +44,11 @@ def generate_weights_bin(output_path: str):
     k3 = [0.25] * HIDDEN_DIM
     v3 = [1.0] * HIDDEN_DIM
 
-    all_floats = gamma1 + k0 + k1 + v0 + v1 + gamma2 + bias + w_ffn + k2 + v2 + k3 + v3
+    w_unembed = [UNEMBED_BASE if v != UNEMBED_TARGET_ROW else UNEMBED_TARGET_BOOST
+                 for v in range(VOCAB_SIZE)
+                 for _ in range(HIDDEN_DIM)]
+
+    all_floats = gamma1 + k0 + k1 + v0 + v1 + gamma2 + bias + w_ffn + k2 + v2 + k3 + v3 + w_unembed
     payload_bytes = struct.pack(f"<{len(all_floats)}f", *all_floats)
     payload_len = len(payload_bytes)
     payload_sum = sum(all_floats)

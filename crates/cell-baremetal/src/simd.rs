@@ -1,7 +1,7 @@
 use core::arch::asm;
 use cell_core::softmax_4_stable;
 
-use crate::tensor_init::{HEAD_DIM, HIDDEN_DIM, NUM_HEADS};
+use crate::tensor_init::{HEAD_DIM, HIDDEN_DIM, NUM_HEADS, VOCAB_SIZE};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SimdLevel {
@@ -452,6 +452,38 @@ pub unsafe fn gemv_512x512_avx(x: *const f32, w: *const f32, out: *mut f32) {
     }
 }
 
+pub unsafe fn gemv_256x512_avx(
+    x: *const f32,
+    w_unembed: *const f32,
+    logits_out: *mut f32,
+) -> f32 {
+    let mut total_sum: f32 = 0.0;
+    for row in 0..VOCAB_SIZE {
+        let w_row = w_unembed.add(row * HIDDEN_DIM);
+        let mut row_sum: f32 = 0.0;
+        for c in 0..(HIDDEN_DIM / HEAD_DIM) {
+            row_sum += dot_product_64_avx(x.add(c * HEAD_DIM), w_row.add(c * HEAD_DIM));
+        }
+        *logits_out.add(row) = row_sum;
+        total_sum += row_sum;
+    }
+    total_sum
+}
+
+pub unsafe fn argmax_256_avx(logits: *const f32) -> (u16, f32) {
+    let mut max_idx: u16 = 0;
+    let mut max_val: f32 = *logits;
+
+    for i in 1..VOCAB_SIZE {
+        let val = *logits.add(i);
+        if val > max_val {
+            max_val = val;
+            max_idx = i as u16;
+        }
+    }
+    (max_idx, max_val)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -561,5 +593,36 @@ mod tests {
             "gemv_512x512 row sum = {}, expected ~2048.0",
             sum
         );
+    }
+
+    #[test]
+    fn gemv_256x512_uniform_logits_checksum() {
+        let x = [6.0f32; 512];
+        let mut w = [1.0 / 512.0f32; 256 * 512];
+        for j in 0..512 {
+            w[67 * 512 + j] = 2.0 / 512.0;
+        }
+        let mut logits = [0.0f32; 256];
+        let total = unsafe { gemv_256x512_avx(x.as_ptr(), w.as_ptr(), logits.as_mut_ptr()) };
+        assert!(
+            (logits[67] - 12.0).abs() < 0.01,
+            "logit[67] = {}, expected 12.0",
+            logits[67]
+        );
+        let diff = (total - 1542.0).abs();
+        assert!(
+            diff < 0.1,
+            "unembed logit sum = {}, expected 1542.0",
+            total
+        );
+    }
+
+    #[test]
+    fn argmax_256_selects_boosted_row() {
+        let mut logits = [1.0f32; 256];
+        logits[67] = 12.0;
+        let (idx, val) = unsafe { argmax_256_avx(logits.as_ptr()) };
+        assert_eq!(idx, 67, "argmax should select row 67");
+        assert!((val - 12.0).abs() < 0.001, "max logit = {}", val);
     }
 }

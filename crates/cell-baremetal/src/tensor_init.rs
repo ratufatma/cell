@@ -12,6 +12,7 @@ pub const WEIGHT_HEADER_SIZE: usize = 64;
 pub const HIDDEN_DIM: usize = 512;
 pub const NUM_HEADS: usize = 8;
 pub const HEAD_DIM: usize = 64;
+pub const VOCAB_SIZE: usize = 256;
 
 pub const WT_GAMMA1_OFF: usize = 0;
 pub const WT_K0_OFF: usize = 512;
@@ -25,7 +26,9 @@ pub const WT_K2_OFF: usize = WT_WFFN_OFF + (HIDDEN_DIM * HIDDEN_DIM);
 pub const WT_V2_OFF: usize = WT_K2_OFF + HIDDEN_DIM;
 pub const WT_K3_OFF: usize = WT_V2_OFF + HIDDEN_DIM;
 pub const WT_V3_OFF: usize = WT_K3_OFF + HIDDEN_DIM;
-pub const WT_TOTAL_FLOATS: usize = WT_V3_OFF + HIDDEN_DIM;
+pub const WT_UNEMBED_OFF: usize = WT_V3_OFF + HIDDEN_DIM;
+pub const WT_UNEMBED_FLOATS: usize = VOCAB_SIZE * HIDDEN_DIM;
+pub const WT_TOTAL_FLOATS: usize = WT_UNEMBED_OFF + WT_UNEMBED_FLOATS;
 
 pub const TENSOR_FRAME_COUNT: usize = 4;
 pub const TB_FRAME_COUNT: usize = 7;

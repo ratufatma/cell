@@ -90,6 +90,8 @@ def run_verification() -> int:
     transformer_block_checksum_verified = False
     external_weights_loaded = False
     autoregressive_kv_full_verified = False
+    unembed_argmax_verified = False
+    generate_steps_seen = set()
     pmm_free_count = 0
 
     for line_str in full_output.splitlines():
@@ -141,6 +143,22 @@ def run_verification() -> int:
             and "expected=3332.75" in line_str
         ):
             autoregressive_kv_full_verified = True
+
+        gen_match = re.search(
+            r"\[AP2 GENERATE\] Step (\d)/4 Token ID=(\d+) \('([^']*)'\)"
+            r" max_logit=([0-9.]+) logits_sum=([0-9.]+)",
+            line_str,
+        )
+        if gen_match:
+            step, token_id, token_char, _, logits_sum = gen_match.groups()
+            generate_steps_seen.add(int(step))
+            if (
+                step == "1"
+                and token_id == "67"
+                and token_char == "C"
+                and logits_sum == "1542.00"
+            ):
+                unembed_argmax_verified = True
 
         if "Trace 4 isolated failure captured" in line_str:
             fault_trace_isolated = True
@@ -244,6 +262,11 @@ def run_verification() -> int:
             "Autoregressive 4-Step KV-Cache Fill",
             autoregressive_kv_full_verified,
             "Incremental token append to 16 KiB block (N=1..4 exact)",
+        ),
+        (
+            "Unembed Proj & Argmax Sampler (Token ID=67 'C')",
+            unembed_argmax_verified,
+            f"Generated token on steps: {sorted(list(generate_steps_seen))}",
         ),
     ]
 

@@ -308,6 +308,16 @@ pub unsafe extern "C" fn ap2_entry(_cpu: &Cpu) -> ! {
                             unsafe { simd::relu_avx(ffn_raw_ptr, 512) };
                             unsafe { simd::vector_add_avx(x1_ptr, ffn_raw_ptr, x2_ptr, 512) };
 
+                            let w_unembed =
+                                ipc::EXTERNAL_WEIGHTS_PTR.add(tensor_init::WT_UNEMBED_OFF);
+                            let logits_sum = unsafe {
+                                simd::gemv_256x512_avx(x2_ptr, w_unembed, ffn_raw_ptr)
+                            };
+                            let (token_id, max_logit) =
+                                unsafe { simd::argmax_256_avx(ffn_raw_ptr) };
+                            let token_char =
+                                core::char::from_u32(token_id as u32).unwrap_or('?');
+
                             let tb_chunk = unsafe { core::slice::from_raw_parts(x2_ptr, 512) };
                             let mut tb_dec_sum = 0.0_f64;
                             for v in tb_chunk { tb_dec_sum += *v as f64; }
@@ -324,6 +334,10 @@ pub unsafe extern "C" fn ap2_entry(_cpu: &Cpu) -> ! {
                                 step, step, step - 1,
                                 mha_sum as f32, tb_dec_f32,
                                 exp_tb, full_tag
+                            );
+                            serial_println!(
+                                "[AP2 GENERATE] Step {}/4 Token ID={} ('{}') max_logit={:.2} logits_sum={:.2}",
+                                step, token_id, token_char, max_logit, logits_sum
                             );
                         }
                         let overflow_slot = seq.reserve_next_token_slot();
