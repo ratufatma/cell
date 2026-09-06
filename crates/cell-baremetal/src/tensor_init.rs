@@ -8,18 +8,23 @@ use crate::ipc;
 pub const WEIGHT_MAGIC: &[u8; 8] = b"CELLWGHT";
 pub const WEIGHT_VERSION: u16 = 1;
 pub const WEIGHT_HEADER_SIZE: usize = 64;
+
+pub const HIDDEN_DIM: usize = 512;
+pub const NUM_HEADS: usize = 8;
+pub const HEAD_DIM: usize = 64;
+
 pub const WT_GAMMA1_OFF: usize = 0;
-pub const WT_K0_OFF: usize = 64;
-pub const WT_K1_OFF: usize = 128;
-pub const WT_V0_OFF: usize = 192;
-pub const WT_V1_OFF: usize = 256;
-pub const WT_GAMMA2_OFF: usize = 320;
-pub const WT_BIAS_OFF: usize = 384;
-pub const WT_WFFN_OFF: usize = 448;
-pub const WT_TOTAL_FLOATS: usize = 4544;
+pub const WT_K0_OFF: usize = 512;
+pub const WT_K1_OFF: usize = 1024;
+pub const WT_V0_OFF: usize = 1536;
+pub const WT_V1_OFF: usize = 2048;
+pub const WT_GAMMA2_OFF: usize = 2560;
+pub const WT_BIAS_OFF: usize = 3072;
+pub const WT_WFFN_OFF: usize = 3584;
+pub const WT_TOTAL_FLOATS: usize = 3584 + (HIDDEN_DIM * HIDDEN_DIM);
 
 pub const TENSOR_FRAME_COUNT: usize = 4;
-pub const TB_FRAME_COUNT: usize = 5;
+pub const TB_FRAME_COUNT: usize = 7;
 
 pub unsafe fn load_external_weights(
     module_response: &limine::response::ModuleResponse,
@@ -93,7 +98,7 @@ where
     F: FnOnce(&mut [f32]),
 {
     let (frame_count, shape_len) = match op {
-        TensorOp::TransformerBlock => (TB_FRAME_COUNT, 5120),
+        TensorOp::TransformerBlock => (TB_FRAME_COUNT, 7168),
         _ => (TENSOR_FRAME_COUNT, 4096),
     };
     // SAFETY: allocate_contiguous_frames returns exclusive ownership of the

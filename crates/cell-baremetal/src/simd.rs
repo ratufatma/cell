@@ -1,6 +1,8 @@
 use core::arch::asm;
 use cell_core::softmax_4_stable;
 
+use crate::tensor_init::{HEAD_DIM, HIDDEN_DIM, NUM_HEADS};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SimdLevel {
     Sse,
@@ -311,10 +313,126 @@ pub unsafe fn rmsnorm_64_avx(
     checksum
 }
 
-pub unsafe fn gemv_64x64_avx(x: *const f32, w: *const f32, out: *mut f32) {
-    for row in 0..64 {
-        let w_row = w.add(row * 64);
-        *out.add(row) = dot_product_64_avx(x, w_row);
+pub unsafe fn multi_head_attention_512_avx(
+    q: *const f32,
+    k_tokens: [*const f32; 4],
+    v_tokens: [*const f32; 4],
+    num_tokens: usize,
+    out: *mut f32,
+) -> f32 {
+    let mut total_sum: f64 = 0.0;
+    for h in 0..NUM_HEADS {
+        let head_offset = h * HEAD_DIM;
+        let q_h = q.add(head_offset);
+        let out_h = out.add(head_offset);
+
+        let k_h = [
+            if !k_tokens[0].is_null() {
+                k_tokens[0].add(head_offset)
+            } else {
+                core::ptr::null()
+            },
+            if !k_tokens[1].is_null() {
+                k_tokens[1].add(head_offset)
+            } else {
+                core::ptr::null()
+            },
+            core::ptr::null(),
+            core::ptr::null(),
+        ];
+        let v_h = [
+            if !v_tokens[0].is_null() {
+                v_tokens[0].add(head_offset)
+            } else {
+                core::ptr::null()
+            },
+            if !v_tokens[1].is_null() {
+                v_tokens[1].add(head_offset)
+            } else {
+                core::ptr::null()
+            },
+            core::ptr::null(),
+            core::ptr::null(),
+        ];
+
+        attention_head_64_avx(q_h, k_h, v_h, num_tokens, out_h);
+
+        for i in 0..HEAD_DIM {
+            total_sum += *out_h.add(i) as f64;
+        }
+    }
+    total_sum as f32
+}
+
+pub unsafe fn rmsnorm_512_avx(
+    x: *const f32,
+    gamma: *const f32,
+    out: *mut f32,
+    eps: f32,
+) -> f32 {
+    let mut sum_sq: f32 = 0.0;
+    for c in 0..(HIDDEN_DIM / HEAD_DIM) {
+        let ptr = x.add(c * HEAD_DIM);
+        sum_sq += dot_product_64_avx(ptr, ptr);
+    }
+    let mean_sq = sum_sq / HIDDEN_DIM as f32;
+    let val = mean_sq + eps;
+    let mut rms: f32 = 0.0;
+    unsafe {
+        asm!(
+            "vmovss xmm0, [{val_ptr}]",
+            "vsqrtss xmm0, xmm0, xmm0",
+            "vmovss [{rms_ptr}], xmm0",
+            val_ptr = in(reg) &val as *const f32,
+            rms_ptr = in(reg) &mut rms as *mut f32,
+            out("xmm0") _,
+            options(nostack),
+        );
+    }
+    let inv_rms = 1.0 / rms;
+
+    unsafe {
+        asm!(
+            "vbroadcastss ymm0, [{inv_ptr}]",
+            "xor {idx}, {idx}",
+            "2:",
+            "vmovups ymm1, [{x} + {idx}]",
+            "vmulps ymm1, ymm1, ymm0",
+            "vmovups ymm2, [{gamma} + {idx}]",
+            "vmulps ymm1, ymm1, ymm2",
+            "vmovups [{out} + {idx}], ymm1",
+            "add {idx}, 32",
+            "cmp {idx}, 2048",
+            "jl 2b",
+            "vzeroupper",
+            inv_ptr = in(reg) &inv_rms as *const f32,
+            x = in(reg) x,
+            gamma = in(reg) gamma,
+            out = in(reg) out,
+            idx = out(reg) _,
+            out("ymm0") _,
+            out("ymm1") _,
+            out("ymm2") _,
+            options(nostack),
+        );
+    }
+
+    let out_slice = core::slice::from_raw_parts(out, HIDDEN_DIM);
+    let mut checksum = 0.0f32;
+    for v in out_slice {
+        checksum += *v;
+    }
+    checksum
+}
+
+pub unsafe fn gemv_512x512_avx(x: *const f32, w: *const f32, out: *mut f32) {
+    for row in 0..HIDDEN_DIM {
+        let w_row = w.add(row * HIDDEN_DIM);
+        let mut row_sum: f32 = 0.0;
+        for c in 0..(HIDDEN_DIM / HEAD_DIM) {
+            row_sum += dot_product_64_avx(x.add(c * HEAD_DIM), w_row.add(c * HEAD_DIM));
+        }
+        *out.add(row) = row_sum;
     }
 }
 
@@ -373,6 +491,59 @@ mod tests {
             "avx_sum={}, scalar_sum={}",
             sum,
             expected
+        );
+    }
+
+    #[test]
+    fn multi_head_attention_512_checksum() {
+        let q = [0.25f32; 512];
+        let k0 = [1.0f32; 512];
+        let k1 = [0.5f32; 512];
+        let v0 = [2.0f32; 512];
+        let v1 = [4.0f32; 512];
+        let mut out = [0.0f32; 512];
+
+        let k_ptrs = [k0.as_ptr(), k1.as_ptr(), core::ptr::null(), core::ptr::null()];
+        let v_ptrs = [v0.as_ptr(), v1.as_ptr(), core::ptr::null(), core::ptr::null()];
+
+        let total = unsafe {
+            multi_head_attention_512_avx(q.as_ptr(), k_ptrs, v_ptrs, 2, out.as_mut_ptr())
+        };
+
+        let diff = (total - 1299.4).abs();
+        assert!(
+            diff < 0.1,
+            "MHA-8 checksum drifted: total = {}, expected ~1299.4",
+            total
+        );
+    }
+
+    #[test]
+    fn rmsnorm_512_uniform_ones_checksum() {
+        let x = [1.0f32; 512];
+        let gamma = [1.0f32; 512];
+        let mut out = [0.0f32; 512];
+        let sum = unsafe { rmsnorm_512_avx(x.as_ptr(), gamma.as_ptr(), out.as_mut_ptr(), 1e-5) };
+        let diff = (sum - 512.0).abs();
+        assert!(
+            diff < 0.5,
+            "rmsnorm_512 sum = {}, expected ~512.0",
+            sum
+        );
+    }
+
+    #[test]
+    fn gemv_512x512_uniform_row_sum() {
+        let x = [1.0f32; 512];
+        let w = [0.0078125f32; 512 * 512];
+        let mut out = [0.0f32; 512];
+        unsafe { gemv_512x512_avx(x.as_ptr(), w.as_ptr(), out.as_mut_ptr()) };
+        let sum: f32 = out.iter().sum();
+        let diff = (sum - 2048.0).abs();
+        assert!(
+            diff < 0.1,
+            "gemv_512x512 row sum = {}, expected ~2048.0",
+            sum
         );
     }
 }

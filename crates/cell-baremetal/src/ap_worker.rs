@@ -184,81 +184,72 @@ pub unsafe extern "C" fn ap2_entry(_cpu: &Cpu) -> ! {
                 }
                 TensorOp::TransformerBlock => {
                     let x0_ptr = base_ptr;
-                    let gamma1_ptr = base_ptr.add(64);
-                    let norm1_ptr = base_ptr.add(128);
-                    let k0_ptr = base_ptr.add(192);
-                    let k1_ptr = base_ptr.add(256);
-                    let v0_ptr = base_ptr.add(320);
-                    let v1_ptr = base_ptr.add(384);
-                    let attn_out_ptr = base_ptr.add(448);
-                    let x1_ptr = base_ptr.add(512);
-                    let gamma2_ptr = base_ptr.add(576);
-                    let norm2_ptr = base_ptr.add(640);
-                    let ffn_out_ptr = base_ptr.add(704);
-                    let x2_ptr = base_ptr.add(768);
-                    let w_ffn_ptr = base_ptr.add(832);
-                    let bias_ptr = base_ptr.add(448);
+                    let gamma1_ptr = base_ptr.add(512);
+                    let norm1_ptr = base_ptr.add(1024);
+                    let k0_ptr = base_ptr.add(1536);
+                    let k1_ptr = base_ptr.add(2048);
+                    let v0_ptr = base_ptr.add(2560);
+                    let v1_ptr = base_ptr.add(3072);
+                    let attn_out_ptr = base_ptr.add(3584);
+                    let x1_ptr = base_ptr.add(4096);
+                    let gamma2_ptr = base_ptr.add(4608);
+                    let norm2_ptr = base_ptr.add(5120);
+                    let ffn_raw_ptr = base_ptr.add(5632);
+                    let bias_ptr = base_ptr.add(6144);
+                    let x2_ptr = base_ptr.add(6656);
 
-                    unsafe { simd::rmsnorm_64_avx(x0_ptr, gamma1_ptr, norm1_ptr, 1e-5) };
-                    serial_println!("[AP2 BLOCK] Step 1: Pre-Attention RMSNorm done");
+                    unsafe { simd::rmsnorm_512_avx(x0_ptr, gamma1_ptr, norm1_ptr, 1e-5) };
+                    serial_println!("[AP2 BLOCK] Step 1: Pre-Attention RMSNorm 512 done");
 
                     let q_ptr = norm1_ptr;
                     unsafe {
-                        let q_scaled = core::slice::from_raw_parts_mut(q_ptr, 64);
+                        let q_scaled = core::slice::from_raw_parts_mut(q_ptr, 512);
                         for v in q_scaled.iter_mut() {
                             *v *= 0.25;
                         }
                     }
                     unsafe {
-                        simd::attention_head_64_avx(
+                        let mha_sum = simd::multi_head_attention_512_avx(
                             q_ptr,
                             [k0_ptr, k1_ptr, core::ptr::null(), core::ptr::null()],
                             [v0_ptr, v1_ptr, core::ptr::null(), core::ptr::null()],
                             2,
                             attn_out_ptr,
                         );
+                        serial_println!(
+                            "[AP2 BLOCK] Step 2: MHA 8-head attention done (sum={:.2})",
+                            mha_sum
+                        );
                     }
-                    serial_println!("[AP2 BLOCK] Step 2: Attention done");
-
-                    unsafe { simd::vector_add_avx(x0_ptr, attn_out_ptr, x1_ptr, 64) };
+                    unsafe { simd::vector_add_avx(x0_ptr, attn_out_ptr, x1_ptr, 512) };
                     serial_println!("[AP2 BLOCK] Step 3: Residual connection 1 done");
 
-                    unsafe { simd::rmsnorm_64_avx(x1_ptr, gamma2_ptr, norm2_ptr, 1e-5) };
+                    unsafe { simd::rmsnorm_512_avx(x1_ptr, gamma2_ptr, norm2_ptr, 1e-5) };
                     serial_println!("[AP2 BLOCK] Step 4: Pre-FFN RMSNorm done");
 
-                    let bias_val = -1.0_f32;
-                    unsafe {
-                        if ipc::EXTERNAL_WEIGHTS_LOADED.load(Ordering::Acquire) {
-                            let wv = ipc::EXTERNAL_WEIGHTS_PTR;
-                            core::ptr::copy_nonoverlapping(wv.add(tensor_init::WT_BIAS_OFF), bias_ptr, 64);
-                        } else {
-                            let bias_slice = core::slice::from_raw_parts_mut(bias_ptr, 64);
-                            for v in bias_slice.iter_mut() {
-                                *v = bias_val;
-                            }
-                        }
-                    }
-                    unsafe { simd::gemv_64x64_avx(norm2_ptr, w_ffn_ptr, ffn_out_ptr) };
-                    unsafe { simd::vector_add_avx(ffn_out_ptr, bias_ptr, ffn_out_ptr, 64) };
-                    unsafe { simd::relu_avx(ffn_out_ptr, 64) };
+                    let w_ffn_ptr = ipc::EXTERNAL_WEIGHTS_PTR.add(tensor_init::WT_WFFN_OFF);
+                    unsafe { simd::gemv_512x512_avx(norm2_ptr, w_ffn_ptr, ffn_raw_ptr) };
+                    unsafe { simd::vector_add_avx(ffn_raw_ptr, bias_ptr, ffn_raw_ptr, 512) };
+                    unsafe { simd::relu_avx(ffn_raw_ptr, 512) };
                     serial_println!("[AP2 BLOCK] Step 5: FFN (GEMV+Bias+ReLU) done");
 
-                    unsafe { simd::vector_add_avx(x1_ptr, ffn_out_ptr, x2_ptr, 64) };
+                    unsafe { simd::vector_add_avx(x1_ptr, ffn_raw_ptr, x2_ptr, 512) };
                     serial_println!("[AP2 BLOCK] Step 6: Residual connection 2 done");
 
-                    let x2_slice = unsafe { core::slice::from_raw_parts(x2_ptr, 64) };
-                    let mut tb_sum = 0.0_f32;
+                    let x2_slice = unsafe { core::slice::from_raw_parts(x2_ptr, 512) };
+                    let mut tb_sum = 0.0_f64;
                     for v in x2_slice {
-                        tb_sum += *v;
+                        tb_sum += *v as f64;
                     }
+                    let tb_sum_f32 = tb_sum as f32;
                     serial_println!(
-                        "[AP2 COMPUTE] Full Transformer Block verified sum={:.2} expected=418.42",
-                        tb_sum
+                        "[AP2 COMPUTE] Full Transformer Block (MHA-8 512) verified sum={:.2} expected=3347.40",
+                        tb_sum_f32
                     );
 
                     let (_context, phys_addr) = task.tensor.deconstruct();
                     ipc::TRANSFORMER_BLOCK_PHYS_ADDR.store(phys_addr, Ordering::Release);
-                    ipc::TRANSFORMER_BLOCK_SUM_BITS.store(tb_sum.to_bits() as usize, Ordering::Release);
+                    ipc::TRANSFORMER_BLOCK_SUM_BITS.store(tb_sum_f32.to_bits() as usize, Ordering::Release);
                     ipc::TRANSFORMER_BLOCK_DONE.store(true, Ordering::Release);
                 }
                 _ => {}
@@ -397,12 +388,12 @@ pub unsafe extern "C" fn ap3_entry(_cpu: &Cpu) -> ! {
     let tb_phys = ipc::TRANSFORMER_BLOCK_PHYS_ADDR.load(Ordering::Acquire);
     let tb_val = f32::from_bits(tb_sum_bits);
     serial_println!(
-        "[CELL TENSOR] AP2 Transformer Block verified sum={:.2} expected=418.42",
+        "[CELL TENSOR] AP2 Transformer Block (MHA-8 512) verified sum={:.2} expected=3347.40",
         tb_val
     );
     crate::serial::telemetry(TelemetryEvent::TensorExecution(TensorExecution {
         context: cell_core::TraceContext::new(103, 0, 1),
-        elements: 64,
+        elements: 512,
         frame_count: tensor_init::TB_FRAME_COUNT as u16,
         dtype: DType::F32 as u8,
         simd_level: 2,

@@ -122,8 +122,8 @@ def run_verification() -> int:
             rmsnorm_checksum_verified = True
 
         if (
-            "Full Transformer Block verified sum=418.42" in line_str
-            and "expected=418.42" in line_str
+            "Full Transformer Block (MHA-8 512) verified sum=3347.40" in line_str
+            and "expected=3347.40" in line_str
         ):
             transformer_block_checksum_verified = True
 
@@ -222,9 +222,9 @@ def run_verification() -> int:
             "Root Mean Square Normalization exact",
         ),
         (
-            "Full Transformer Block Checksum (sum=418.42)",
+            "Full Transformer Block Checksum (MHA-8 sum=3347.40)",
             transformer_block_checksum_verified,
-            "Norm -> Attn -> Res -> Norm -> FFN -> Res exact",
+            "MHA-8 Norm -> Attn -> Res -> Norm -> FFN -> Res exact",
         ),
         (
             "External Weights Module (weights.bin)",

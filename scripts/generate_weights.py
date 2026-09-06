@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
 scripts/generate_weights.py
-Generates weights.bin binary for CELL Transformer Block.
+Generates weights.bin binary for CELL Transformer Block (8-head MHA, d_model=512).
 
 Format:
   Header (64 bytes): Magic(8) + Version(2) + Reserved(6) + DataLen(4) + Checksum(4) + Pad(40)
-  Payload (N floats): gamma1(64) + K0(64) + K1(64) + V0(64) + V1(64) + gamma2(64) + bias(64) + W_ffn(4096)
+  Payload (N floats): gamma1(512) + K0(512) + K1(512) + V0(512) + V1(512) + gamma2(512) + bias(512) + W_ffn(512x512)
 """
 
 import struct
@@ -16,16 +16,22 @@ MAGIC = b"CELLWGHT"
 VERSION = 1
 HEADER_SIZE = 64
 
+HIDDEN_DIM = 512
+NUM_HEADS = 8
+HEAD_DIM = 64
+PARAM_VECTOR = 7 * HIDDEN_DIM
+WFFN_FLOATS = HIDDEN_DIM * HIDDEN_DIM
+
 
 def generate_weights_bin(output_path: str):
-    gamma1 = [1.0] * 64
-    k0 = [1.0] * 64
-    k1 = [0.5] * 64
-    v0 = [2.0] * 64
-    v1 = [4.0] * 64
-    gamma2 = [1.0] * 64
-    bias = [-1.0] * 64
-    w_ffn = [0.0625] * (64 * 64)
+    gamma1 = [1.0] * HIDDEN_DIM
+    k0 = [1.0] * HIDDEN_DIM
+    k1 = [0.5] * HIDDEN_DIM
+    v0 = [2.0] * HIDDEN_DIM
+    v1 = [4.0] * HIDDEN_DIM
+    gamma2 = [1.0] * HIDDEN_DIM
+    bias = [-1.0] * HIDDEN_DIM
+    w_ffn = [0.0078125] * WFFN_FLOATS
 
     all_floats = gamma1 + k0 + k1 + v0 + v1 + gamma2 + bias + w_ffn
     payload_bytes = struct.pack(f"<{len(all_floats)}f", *all_floats)

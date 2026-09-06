@@ -195,32 +195,31 @@ pub unsafe fn bsp_main(
             TensorOp::TransformerBlock,
             0,
             0,
-            768,
-            64,
+            6656,
+            512,
             |s: &mut [f32]| {
-                s[0..64].fill(1.0);
-                s[128..192].fill(0.0);
-                s[512..576].fill(0.0);
-                s[640..704].fill(0.0);
-                s[704..768].fill(0.0);
-                s[768..832].fill(0.0);
+                s[0..512].fill(1.0);
+                s[1024..1536].fill(0.0);
+                s[3584..4096].fill(0.0);
+                s[4096..4608].fill(0.0);
+                s[5120..5632].fill(0.0);
+                s[5632..6144].fill(0.0);
+                s[6656..7168].fill(0.0);
                 let wv =
                     core::slice::from_raw_parts(weights_ptr, tensor_init::WT_TOTAL_FLOATS);
-                s[64..128].copy_from_slice(&wv[tensor_init::WT_GAMMA1_OFF..tensor_init::WT_GAMMA1_OFF + 64]);
-                s[192..256].copy_from_slice(&wv[tensor_init::WT_K0_OFF..tensor_init::WT_K0_OFF + 64]);
-                s[256..320].copy_from_slice(&wv[tensor_init::WT_K1_OFF..tensor_init::WT_K1_OFF + 64]);
-                s[320..384].copy_from_slice(&wv[tensor_init::WT_V0_OFF..tensor_init::WT_V0_OFF + 64]);
-                s[384..448].copy_from_slice(&wv[tensor_init::WT_V1_OFF..tensor_init::WT_V1_OFF + 64]);
-                s[576..640].copy_from_slice(&wv[tensor_init::WT_GAMMA2_OFF..tensor_init::WT_GAMMA2_OFF + 64]);
-                s[448..512].copy_from_slice(&wv[tensor_init::WT_BIAS_OFF..tensor_init::WT_BIAS_OFF + 64]);
-                s[832..4928].copy_from_slice(&wv[tensor_init::WT_WFFN_OFF..tensor_init::WT_WFFN_OFF + 4096]);
-                s[4928..5120].fill(0.0625);
+                s[512..1024].copy_from_slice(&wv[tensor_init::WT_GAMMA1_OFF..tensor_init::WT_GAMMA1_OFF + 512]);
+                s[1536..2048].copy_from_slice(&wv[tensor_init::WT_K0_OFF..tensor_init::WT_K0_OFF + 512]);
+                s[2048..2560].copy_from_slice(&wv[tensor_init::WT_K1_OFF..tensor_init::WT_K1_OFF + 512]);
+                s[2560..3072].copy_from_slice(&wv[tensor_init::WT_V0_OFF..tensor_init::WT_V0_OFF + 512]);
+                s[3072..3584].copy_from_slice(&wv[tensor_init::WT_V1_OFF..tensor_init::WT_V1_OFF + 512]);
+                s[4608..5120].copy_from_slice(&wv[tensor_init::WT_GAMMA2_OFF..tensor_init::WT_GAMMA2_OFF + 512]);
+                s[6144..6656].copy_from_slice(&wv[tensor_init::WT_BIAS_OFF..tensor_init::WT_BIAS_OFF + 512]);
             },
         )
     };
     serial_println!(
         "[CELL PMM] allocated transformer block buffer count={} phys=0x{:x}",
-        tensor_init::TENSOR_FRAME_COUNT,
+        tensor_init::TB_FRAME_COUNT,
         transformer_task.tensor.phys_addr
     );
     serial_println!(
