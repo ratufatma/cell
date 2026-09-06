@@ -8,37 +8,34 @@ pub const BLOCK_SIZE_BYTES: usize = TOKENS_PER_BLOCK * BYTES_PER_TOKEN;
 
 pub const ATTENTION_SCALE: f32 = 0.125;
 
-pub fn softmax_4_stable(scores: &[f32; 4], n: usize) -> [f32; 4] {
-    let mut weights = [0.0f32; 4];
-    if n == 0 {
-        return weights;
+pub fn softmax_4_stable(scores: [f32; 4], valid_count: usize) -> [f32; 4] {
+    if valid_count == 0 {
+        return [0.0; 4];
     }
 
-    let mut max_val = scores[0];
-    for i in 1..n {
+    let mut max_val = f32::NEG_INFINITY;
+    for i in 0..valid_count.min(4) {
         if scores[i] > max_val {
             max_val = scores[i];
         }
     }
 
-    let mut sum_exp = 0.0f32;
-    for i in 0..n {
-        let x = scores[i] - max_val;
-        let e = if x < -8.0 {
-            0.0
-        } else {
-            1.0 + x * (1.0 + x * (0.5 + x * (1.0 / 6.0 + x / 24.0)))
-        };
-        weights[i] = e;
-        sum_exp += e;
+    let mut exp_vals = [0.0_f32; 4];
+    let mut sum = 0.0_f32;
+    for i in 0..valid_count.min(4) {
+        let e = libm::expf(scores[i] - max_val);
+        exp_vals[i] = e;
+        sum += e;
     }
 
-    if sum_exp > 0.0 {
-        for i in 0..n {
-            weights[i] /= sum_exp;
+    if sum > 0.0 {
+        let inv_sum = 1.0 / sum;
+        for i in 0..valid_count.min(4) {
+            exp_vals[i] *= inv_sum;
         }
     }
-    weights
+
+    exp_vals
 }
 
 pub fn dot_product_64_scalar(a: &[f32; 64], b: &[f32; 64]) -> f32 {
@@ -298,7 +295,7 @@ mod tests {
     #[test]
     fn softmax_single_element_is_one() {
         let scores = [3.0, 0.0, 0.0, 0.0];
-        let w = softmax_4_stable(&scores, 1);
+        let w = softmax_4_stable(scores, 1);
         assert!((w[0] - 1.0).abs() < 1e-6);
         assert_eq!(w[1], 0.0);
     }
@@ -306,7 +303,7 @@ mod tests {
     #[test]
     fn softmax_two_equal_scores_are_half() {
         let scores = [1.0, 1.0, 0.0, 0.0];
-        let w = softmax_4_stable(&scores, 2);
+        let w = softmax_4_stable(scores, 2);
         assert!((w[0] - 0.5).abs() < 1e-5);
         assert!((w[1] - 0.5).abs() < 1e-5);
     }
@@ -314,7 +311,7 @@ mod tests {
     #[test]
     fn softmax_weights_sum_to_one() {
         let scores = [2.0, 1.0, 0.5, 0.0];
-        let w = softmax_4_stable(&scores, 4);
+        let w = softmax_4_stable(scores, 4);
         let total: f32 = w.iter().sum();
         assert!((total - 1.0).abs() < 1e-5);
     }
@@ -322,8 +319,12 @@ mod tests {
     #[test]
     fn softmax_zeroes_out_large_negative() {
         let scores = [0.0, -20.0, -100.0, 0.0];
-        let w = softmax_4_stable(&scores, 4);
-        assert_eq!(w[2], 0.0);
+        let w = softmax_4_stable(scores, 4);
+        assert!(
+            w[2] < 1e-30,
+            "large negative score must be numerically negligible, got {}",
+            w[2]
+        );
         let total: f32 = w.iter().sum();
         assert!((total - 1.0).abs() < 1e-5);
     }
@@ -350,7 +351,7 @@ mod tests {
         assert!((s1 - 1.0).abs() < 1e-5);
 
         let scores = [s0, s1, 0.0, 0.0];
-        let w = softmax_4_stable(&scores, 2);
+        let w = softmax_4_stable(scores, 2);
         let total_w: f32 = w[0] + w[1];
         assert!((total_w - 1.0).abs() < 1e-5);
 
@@ -360,9 +361,10 @@ mod tests {
         }
 
         let checksum: f32 = out.iter().sum();
+        let diff = (checksum - 162.4245).abs();
         assert!(
-            (checksum - 162.909).abs() < 0.01,
-            "checksum = {}, expected ~162.909 (Taylor exp)",
+            diff < 1e-3,
+            "Attention checksum drifted: checksum = {}, expected ~162.4245 (exact exp)",
             checksum
         );
     }

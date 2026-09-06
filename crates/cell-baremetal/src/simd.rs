@@ -103,6 +103,7 @@ pub unsafe fn gemm_32x32_avx(a: *const f32, b: *const f32, c: *mut f32) {
 }
 
 pub unsafe fn vector_add_avx(a: *const f32, b: *const f32, out: *mut f32, count: usize) {
+    assert_eq!(count % 8, 0, "vector_add_avx requires count divisible by 8");
     for i in (0..count).step_by(8) {
         unsafe {
             asm!(
@@ -124,6 +125,7 @@ pub unsafe fn vector_add_avx(a: *const f32, b: *const f32, out: *mut f32, count:
 }
 
 pub unsafe fn relu_avx(data: *mut f32, count: usize) {
+    assert_eq!(count % 8, 0, "relu_avx requires count divisible by 8");
     for i in (0..count).step_by(8) {
         unsafe {
             asm!(
@@ -196,7 +198,7 @@ pub unsafe fn attention_head_64_avx(
         scores[i] = dot * SCALE;
     }
 
-    let weights = softmax_4_stable(&scores, n);
+    let weights = softmax_4_stable(scores, n);
 
     for i in 0..n {
         let w = weights[i];
@@ -351,9 +353,10 @@ mod tests {
         }
 
         let checksum: f32 = out.iter().sum();
+        let diff = (checksum - 162.4245).abs();
         assert!(
-            (checksum - 162.909).abs() < 0.01,
-            "checksum = {}, expected ~162.909",
+            diff < 1e-3,
+            "Attention checksum drifted: checksum = {}, expected ~162.4245 (exact exp)",
             checksum
         );
     }

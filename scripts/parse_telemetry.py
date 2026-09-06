@@ -55,15 +55,19 @@ def decode_pmm_snapshot(payload: bytes) -> Dict[str, Any]:
 
 
 def decode_queue_metrics(payload: bytes) -> Dict[str, Any]:
-    if len(payload) != 16:
+    if len(payload) != 20:
         return {"raw_hex": payload.hex()}
-    queue_id, capacity, pushed, popped, dropped = struct.unpack("<HHIII", payload)
+    queue_id, capacity, pushed, popped, dropped = struct.unpack("<HHIII", payload[:16])
+    watermark_state = payload[16]
     return {
         "queue_id": queue_id,
         "capacity": capacity,
         "pushed": pushed,
         "popped": popped,
         "dropped": dropped,
+        "watermark_state": {0: "normal", 1: "high", 2: "draining"}.get(
+            watermark_state, f"Unknown({watermark_state})"
+        ),
     }
 
 

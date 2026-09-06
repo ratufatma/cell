@@ -19,7 +19,7 @@ use core::fmt::{self, Write};
 use core::mem::size_of;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use limine::mp::Cpu;
-use limine::request::{HhdmRequest, MemoryMapRequest, RequestsEndMarker, RequestsStartMarker};
+use limine::request::{HhdmRequest, MemoryMapRequest, ModuleRequest, RequestsEndMarker, RequestsStartMarker};
 use limine::BaseRevision;
 
 #[used]
@@ -44,6 +44,10 @@ static MEMMAP_REQUEST: MemoryMapRequest = MemoryMapRequest::new();
 static HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
 
 #[used]
+#[link_section = ".limine_requests"]
+static MODULE_REQUEST: ModuleRequest = ModuleRequest::new();
+
+#[used]
 #[link_section = ".requests_end_marker"]
 static REQUESTS_END_MARKER: RequestsEndMarker = RequestsEndMarker::new();
 
@@ -51,6 +55,9 @@ const COM1: u16 = 0x3f8;
 const PACKET_COUNT: usize = 10;
 const TENSOR_FRAME_COUNT: usize = 4;
 const TB_FRAME_COUNT: usize = 5;
+const TENSOR_TASK_COUNT: usize = 4;
+const DOWNSTREAM_BUSY_SPINS: usize = 5_000_000;
+const INITIAL_STALL_PACKETS: usize = 3;
 pub enum PipelineMessage {
     Valid(ValidatedPayload),
     BypassFault {
@@ -82,6 +89,7 @@ static RMSNORM_SUM_BITS: AtomicUsize = AtomicUsize::new(0);
 static TRANSFORMER_BLOCK_DONE: AtomicBool = AtomicBool::new(false);
 static TRANSFORMER_BLOCK_PHYS_ADDR: AtomicUsize = AtomicUsize::new(0);
 static TRANSFORMER_BLOCK_SUM_BITS: AtomicUsize = AtomicUsize::new(0);
+static EXTERNAL_WEIGHTS_LOADED: AtomicBool = AtomicBool::new(false);
 static SERIAL_LOCK: AtomicBool = AtomicBool::new(false);
 static mut TELEMETRY: TelemetryEncoder = TelemetryEncoder::new();
 
@@ -167,13 +175,13 @@ fn serial_write(arguments: fmt::Arguments<'_>) {
 }
 
 fn telemetry_write(event: TelemetryEvent) {
-    let frame = unsafe { (&mut *core::ptr::addr_of_mut!(TELEMETRY)).encode(event) };
     while SERIAL_LOCK
         .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
         .is_err()
     {
         core::hint::spin_loop();
     }
+    let frame = unsafe { (&mut *core::ptr::addr_of_mut!(TELEMETRY)).encode(event) };
     unsafe {
         let serial = &mut *core::ptr::addr_of_mut!(SERIAL);
         for byte in b"[CELL TM] " {
@@ -327,7 +335,7 @@ pub extern "C" fn _start() -> ! {
     let dropped = 0_u32;
 
     for trace_id in 1..=PACKET_COUNT {
-        while QUEUE_INGRESS_TO_W1.is_congested() {
+        if QUEUE_INGRESS_TO_W1.is_congested() {
             let pct = QUEUE_INGRESS_TO_W1.occupancy_pct();
             serial_println!(
                 "[CELL FLOW] High watermark reached ({}%) -> Backpressure active",
@@ -548,7 +556,7 @@ pub extern "C" fn _start() -> ! {
     for bytes in t_slice[3072..3328].chunks_exact_mut(size_of::<f32>()) {
         bytes.copy_from_slice(&zero_f);
     }
-    for bytes in t_slice[3328..16384].chunks_exact_mut(size_of::<f32>()) {
+    for bytes in t_slice[3328..].chunks_exact_mut(size_of::<f32>()) {
         bytes.copy_from_slice(&w_ffn_f);
     }
     let tb_tensor = tb_tensor.freeze();
@@ -592,8 +600,15 @@ unsafe extern "C" fn ap1_worker_entry(_cpu: &Cpu) -> ! {
     );
     let verifier = ValidatorCapability::new(0xCE11_2021);
     let mut processed = 0;
+    let mut stalled_packets = 0;
     while processed < PACKET_COUNT {
         if let Some(raw) = QUEUE_INGRESS_TO_W1.pop() {
+            if stalled_packets < INITIAL_STALL_PACKETS {
+                for _ in 0..DOWNSTREAM_BUSY_SPINS {
+                    core::hint::spin_loop();
+                }
+                stalled_packets += 1;
+            }
             let message = if raw.is_empty() {
                 PipelineMessage::BypassFault {
                     context: raw.context(),
@@ -611,7 +626,7 @@ unsafe extern "C" fn ap1_worker_entry(_cpu: &Cpu) -> ! {
             core::hint::spin_loop();
         }
     }
-    for _ in 0..4 {
+    for _ in 0..TENSOR_TASK_COUNT {
         loop {
             if let Some(task) = TENSOR_HOP1.pop() {
                 if TENSOR_HOP2.push(task).is_err() {
@@ -655,7 +670,7 @@ unsafe extern "C" fn ap2_compute_entry(_cpu: &Cpu) -> ! {
         }
     }
     let mut tensors_processed = 0_u32;
-    while tensors_processed < 4 {
+    while (tensors_processed as usize) < TENSOR_TASK_COUNT {
         if let Some(task) = wait_task(&TENSOR_HOP2) {
             let base_ptr = task.tensor.virt_ptr as *mut f32;
             match task.op {
@@ -821,7 +836,8 @@ unsafe extern "C" fn ap2_compute_entry(_cpu: &Cpu) -> ! {
             }
             tensors_processed += 1;
         } else {
-            core::hint::spin_loop();
+            serial_println!("[AP2 COMPUTE] tensor task timeout, aborting");
+            break;
         }
     }
     AP2_DONE.store(true, Ordering::Release);
@@ -989,10 +1005,21 @@ unsafe extern "C" fn ap3_supervisor_entry(_cpu: &Cpu) -> ! {
     halt()
 }
 
+const WAIT_TASK_SPIN_LIMIT: usize = 1_000_000;
+
 fn wait_task<T>(queue: &SpscQueue<T, 8>) -> Option<T> {
+    let mut spins = 0_usize;
     loop {
         if let Some(value) = queue.pop() {
             return Some(value);
+        }
+        spins += 1;
+        if spins >= WAIT_TASK_SPIN_LIMIT {
+            serial_println!(
+                "[CELL WARN] wait_task timed out after {} spins",
+                WAIT_TASK_SPIN_LIMIT
+            );
+            return None;
         }
         core::hint::spin_loop();
     }

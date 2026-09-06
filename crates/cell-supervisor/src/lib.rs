@@ -42,8 +42,10 @@ impl<const CAP: usize> Supervisor<CAP> {
         if self.len < CAP {
             self.records[self.len] = Some(record);
             self.len += 1;
+            Some(record)
+        } else {
+            None
         }
-        Some(record)
     }
 
     pub fn failure_count(&self) -> usize {

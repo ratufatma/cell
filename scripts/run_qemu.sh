@@ -9,9 +9,12 @@ ISO_DIR="${ROOT_DIR}/target/cell-iso"
 ISO_PATH="${ROOT_DIR}/target/cell.iso"
 KERNEL="${ROOT_DIR}/target/x86_64-unknown-none/debug/cell-baremetal"
 
+WEIGHTS_PATH="${ROOT_DIR}/target/weights.bin"
+
 command -v cargo >/dev/null || { echo "cargo is required" >&2; exit 1; }
 command -v xorriso >/dev/null || { echo "xorriso is required" >&2; exit 1; }
 command -v qemu-system-x86_64 >/dev/null || { echo "qemu-system-x86_64 is required" >&2; exit 1; }
+command -v python3 >/dev/null || { echo "python3 is required" >&2; exit 1; }
 
 if [[ ! -x "${TOOLS_DIR}/limine" ]]; then
     mkdir -p "${TOOLS_DIR}"
@@ -32,9 +35,11 @@ if [[ -z "${LIMINE_DIR}" ]]; then
 fi
 
 cargo build --target x86_64-unknown-none -p cell-baremetal
+python3 "${ROOT_DIR}/scripts/generate_weights.py" "${WEIGHTS_PATH}"
 rm -rf "${ISO_DIR}"
 mkdir -p "${ISO_DIR}/boot/limine"
 cp "${KERNEL}" "${ISO_DIR}/boot/cell-baremetal"
+cp "${WEIGHTS_PATH}" "${ISO_DIR}/boot/weights.bin"
 cp "${LIMINE_DIR}/limine-bios-cd.bin" "${ISO_DIR}/boot/limine/"
 cp "${LIMINE_DIR}/limine-bios.sys" "${ISO_DIR}/boot/limine/"
 cat > "${ISO_DIR}/boot/limine/limine.conf" <<'EOF'
@@ -45,6 +50,7 @@ verbose: yes
 /CELL
     protocol: limine
     path: boot():/boot/cell-baremetal
+    module_path: boot():/boot/weights.bin
 EOF
 xorriso -as mkisofs -b boot/limine/limine-bios-cd.bin \
     -no-emul-boot -boot-load-size 4 -boot-info-table \
