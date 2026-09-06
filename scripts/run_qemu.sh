@@ -78,4 +78,5 @@ exec qemu-system-x86_64 \
     -m 512M \
     -cdrom "${ISO_PATH}" \
     -serial stdio \
-    -display none
+    -display none \
+    -no-reboot

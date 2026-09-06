@@ -8,8 +8,9 @@ Validasi:
   2. Flow Control & Backpressure (HWM throttled, LWM released, 0 dropped)
   3. Dynamic Dispatch & Chained Compute (MatMul -> VectorAdd -> ReLU == 51200.0)
   4. Fault Containment (Trace 4 isolated, zero kernel crash)
-  5. PMM 4-Frame Contiguous Memory Reclaim
-  6. CELLTM Binary Telemetry Stream (20-byte QueueMetrics, Tensor, Fault, PMM)
+5. PMM 4-Frame Contiguous Memory Reclaim
+   6. CELLTM Binary Telemetry Stream (20-byte QueueMetrics, Tensor, Fault, PMM)
+   7. External Weights Module (weights.bin) loaded via Limine module request
 """
 
 import os
@@ -87,6 +88,7 @@ def run_verification() -> int:
     attention_checksum_verified = False
     rmsnorm_checksum_verified = False
     transformer_block_checksum_verified = False
+    external_weights_loaded = False
     pmm_free_count = 0
 
     for line_str in full_output.splitlines():
@@ -124,6 +126,12 @@ def run_verification() -> int:
             and "expected=418.42" in line_str
         ):
             transformer_block_checksum_verified = True
+
+        if (
+            "[MODULE LOADER] Weights loaded into PMM" in line_str
+            and "magic=CELLWGHT verified" in line_str
+        ):
+            external_weights_loaded = True
 
         if "Trace 4 isolated failure captured" in line_str:
             fault_trace_isolated = True
@@ -217,6 +225,11 @@ def run_verification() -> int:
             "Full Transformer Block Checksum (sum=418.42)",
             transformer_block_checksum_verified,
             "Norm -> Attn -> Res -> Norm -> FFN -> Res exact",
+        ),
+        (
+            "External Weights Module (weights.bin)",
+            external_weights_loaded,
+            "CELWGHT magic verified via Limine module request",
         ),
     ]
 

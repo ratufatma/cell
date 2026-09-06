@@ -58,6 +58,18 @@ const TB_FRAME_COUNT: usize = 5;
 const TENSOR_TASK_COUNT: usize = 4;
 const DOWNSTREAM_BUSY_SPINS: usize = 5_000_000;
 const INITIAL_STALL_PACKETS: usize = 3;
+const WEIGHT_MAGIC: &[u8; 8] = b"CELLWGHT";
+const WEIGHT_VERSION: u16 = 1;
+const WEIGHT_HEADER_SIZE: usize = 64;
+const WT_GAMMA1_OFF: usize = 0;
+const WT_K0_OFF: usize = 64;
+const WT_K1_OFF: usize = 128;
+const WT_V0_OFF: usize = 192;
+const WT_V1_OFF: usize = 256;
+const WT_GAMMA2_OFF: usize = 320;
+const WT_BIAS_OFF: usize = 384;
+const WT_WFFN_OFF: usize = 448;
+const WT_TOTAL_FLOATS: usize = 4544;
 pub enum PipelineMessage {
     Valid(ValidatedPayload),
     BypassFault {
@@ -90,6 +102,8 @@ static TRANSFORMER_BLOCK_DONE: AtomicBool = AtomicBool::new(false);
 static TRANSFORMER_BLOCK_PHYS_ADDR: AtomicUsize = AtomicUsize::new(0);
 static TRANSFORMER_BLOCK_SUM_BITS: AtomicUsize = AtomicUsize::new(0);
 static EXTERNAL_WEIGHTS_LOADED: AtomicBool = AtomicBool::new(false);
+static EXTERNAL_WEIGHTS_PTR: AtomicUsize = AtomicUsize::new(0);
+static EXTERNAL_WEIGHTS_FRAMES: AtomicUsize = AtomicUsize::new(0);
 static SERIAL_LOCK: AtomicBool = AtomicBool::new(false);
 static mut TELEMETRY: TelemetryEncoder = TelemetryEncoder::new();
 
@@ -202,6 +216,50 @@ fn hex_digit(value: u8) -> u8 {
         0..=9 => b'0' + value,
         _ => b'a' + (value - 10),
     }
+}
+
+fn load_external_weights(hhdm_offset: u64) -> Option<*mut u8> {
+    let response = MODULE_REQUEST.get_response()?;
+    let modules = response.modules();
+    let module = modules
+        .iter()
+        .find(|module| module.path().to_bytes().ends_with(b"weights.bin"));
+    let Some(module) = module else {
+        serial_println!("[MODULE LOADER] weights.bin module not found");
+        return None;
+    };
+    let module_size = module.size() as usize;
+    let module_virt = module.addr() as *const u8;
+    let header = unsafe { core::slice::from_raw_parts(module_virt, WEIGHT_HEADER_SIZE) };
+    if &header[0..8] != WEIGHT_MAGIC.as_slice() {
+        serial_println!("[MODULE LOADER] invalid magic in weights.bin");
+        return None;
+    }
+    let version = u16::from_le_bytes([header[8], header[9]]);
+    if version != WEIGHT_VERSION {
+        serial_println!(
+            "[MODULE LOADER] unsupported weights version: {}",
+            version
+        );
+        return None;
+    }
+    if module_size < WEIGHT_HEADER_SIZE + WT_TOTAL_FLOATS * size_of::<f32>() {
+        serial_println!("[MODULE LOADER] weights.bin too small: {}", module_size);
+        return None;
+    }
+    let frames = (module_size + 4095) / 4096;
+    let frame = unsafe { pmm::allocate_contiguous_frames(frames) }?;
+    let block_virt = (hhdm_offset as usize + frame.address() as usize) as *mut u8;
+    unsafe { core::ptr::copy_nonoverlapping(module_virt, block_virt, module_size) };
+    EXTERNAL_WEIGHTS_PTR.store(block_virt as usize, Ordering::Release);
+    EXTERNAL_WEIGHTS_FRAMES.store(frames, Ordering::Release);
+    EXTERNAL_WEIGHTS_LOADED.store(true, Ordering::Release);
+    serial_println!(
+        "[MODULE LOADER] Weights loaded into PMM: frames={} phys=0x{:x} magic=CELLWGHT verified",
+        frames,
+        frame.address()
+    );
+    Some(block_virt)
 }
 
 #[unsafe(no_mangle)]
@@ -497,6 +555,11 @@ pub extern "C" fn _start() -> ! {
         halt();
     }
 
+    let _weights_virt = load_external_weights(hhdm.offset()).unwrap_or_else(|| {
+        serial_println!("[MODULE LOADER] failed to load weights.bin");
+        halt()
+    });
+
     let tb_frame =
         unsafe { pmm::allocate_contiguous_frames(TB_FRAME_COUNT) }.unwrap_or_else(|| halt());
     let tb_virtual = hhdm
@@ -511,41 +574,16 @@ pub extern "C" fn _start() -> ! {
         DType::F32,
     );
     let one_f = 1.0_f32.to_ne_bytes();
-    let half_f = 0.5_f32.to_ne_bytes();
-    let two_f = 2.0_f32.to_ne_bytes();
-    let four_f = 4.0_f32.to_ne_bytes();
-    let w_ffn_f = 0.0625_f32.to_ne_bytes();
     let zero_f = 0.0_f32.to_ne_bytes();
     let t_slice = tb_tensor.as_mut_slice();
     for bytes in t_slice[0..256].chunks_exact_mut(size_of::<f32>()) {
         bytes.copy_from_slice(&one_f);
     }
-    for bytes in t_slice[256..512].chunks_exact_mut(size_of::<f32>()) {
-        bytes.copy_from_slice(&one_f);
-    }
     for bytes in t_slice[512..768].chunks_exact_mut(size_of::<f32>()) {
-        bytes.copy_from_slice(&zero_f);
-    }
-    for bytes in t_slice[768..1024].chunks_exact_mut(size_of::<f32>()) {
-        bytes.copy_from_slice(&one_f);
-    }
-    for bytes in t_slice[1024..1280].chunks_exact_mut(size_of::<f32>()) {
-        bytes.copy_from_slice(&half_f);
-    }
-    for bytes in t_slice[1280..1536].chunks_exact_mut(size_of::<f32>()) {
-        bytes.copy_from_slice(&two_f);
-    }
-    for bytes in t_slice[1536..1792].chunks_exact_mut(size_of::<f32>()) {
-        bytes.copy_from_slice(&four_f);
-    }
-    for bytes in t_slice[1792..2048].chunks_exact_mut(size_of::<f32>()) {
         bytes.copy_from_slice(&zero_f);
     }
     for bytes in t_slice[2048..2304].chunks_exact_mut(size_of::<f32>()) {
         bytes.copy_from_slice(&zero_f);
-    }
-    for bytes in t_slice[2304..2560].chunks_exact_mut(size_of::<f32>()) {
-        bytes.copy_from_slice(&one_f);
     }
     for bytes in t_slice[2560..2816].chunks_exact_mut(size_of::<f32>()) {
         bytes.copy_from_slice(&zero_f);
@@ -556,8 +594,18 @@ pub extern "C" fn _start() -> ! {
     for bytes in t_slice[3072..3328].chunks_exact_mut(size_of::<f32>()) {
         bytes.copy_from_slice(&zero_f);
     }
-    for bytes in t_slice[3328..].chunks_exact_mut(size_of::<f32>()) {
-        bytes.copy_from_slice(&w_ffn_f);
+    let tb_f = t_slice.as_mut_ptr().cast::<f32>();
+    let wv = EXTERNAL_WEIGHTS_PTR.load(Ordering::Acquire) as *const u8;
+    let wv = unsafe { wv.add(WEIGHT_HEADER_SIZE) }.cast::<f32>();
+    unsafe {
+        core::ptr::copy_nonoverlapping(wv.add(WT_GAMMA1_OFF), tb_f.add(64), 64);
+        core::ptr::copy_nonoverlapping(wv.add(WT_K0_OFF), tb_f.add(192), 64);
+        core::ptr::copy_nonoverlapping(wv.add(WT_K1_OFF), tb_f.add(256), 64);
+        core::ptr::copy_nonoverlapping(wv.add(WT_V0_OFF), tb_f.add(320), 64);
+        core::ptr::copy_nonoverlapping(wv.add(WT_V1_OFF), tb_f.add(384), 64);
+        core::ptr::copy_nonoverlapping(wv.add(WT_GAMMA2_OFF), tb_f.add(576), 64);
+        core::ptr::copy_nonoverlapping(wv.add(WT_BIAS_OFF), tb_f.add(448), 64);
+        core::ptr::copy_nonoverlapping(wv.add(WT_WFFN_OFF), tb_f.add(832), 64 * 64);
     }
     let tb_tensor = tb_tensor.freeze();
     let transformer_task = TaskDescriptor {
@@ -804,9 +852,15 @@ unsafe extern "C" fn ap2_compute_entry(_cpu: &Cpu) -> ! {
 
                     let bias_val = -1.0_f32;
                     unsafe {
-                        let bias_slice = core::slice::from_raw_parts_mut(bias_ptr, 64);
-                        for v in bias_slice.iter_mut() {
-                            *v = bias_val;
+                        if EXTERNAL_WEIGHTS_LOADED.load(Ordering::Acquire) {
+                            let wv = EXTERNAL_WEIGHTS_PTR.load(Ordering::Acquire) as *const u8;
+                            let wv = wv.add(WEIGHT_HEADER_SIZE).cast::<f32>();
+                            core::ptr::copy_nonoverlapping(wv.add(WT_BIAS_OFF), bias_ptr, 64);
+                        } else {
+                            let bias_slice = core::slice::from_raw_parts_mut(bias_ptr, 64);
+                            for v in bias_slice.iter_mut() {
+                                *v = bias_val;
+                            }
                         }
                     }
                     unsafe { simd::gemv_64x64_avx(norm2_ptr, w_ffn_ptr, ffn_out_ptr) };
