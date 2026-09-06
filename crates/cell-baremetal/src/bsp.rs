@@ -4,7 +4,7 @@ use cell_core::{RawPayload, TensorOp, TraceContext};
 use cell_supervisor::telemetry::{QueueMetrics, TelemetryEvent};
 
 use crate::ap_worker;
-use crate::{ipc, serial, tensor_init};
+use crate::{ipc, pmm, serial, tensor_init};
 
 pub unsafe fn bsp_main(
     hhdm_offset: u64,
@@ -230,6 +230,21 @@ pub unsafe fn bsp_main(
         serial_println!("[CELL TENSOR] hop 1 queue full for transformer task");
         ipc::halt();
     }
+
+    let kv_frame = unsafe { pmm::allocate_contiguous_frames(4) }.unwrap_or_else(|| ipc::halt());
+    let kv_block_virt = (hhdm_offset as usize + kv_frame.address() as usize) as *mut u8;
+    ipc::KV_CACHE_PHYS_ADDR.store(kv_frame.address() as usize, Ordering::Release);
+    ipc::KV_CACHE_BLOCK_ID.store(2000, Ordering::Release);
+    unsafe { ipc::KV_CACHE_VIRT = kv_block_virt; }
+    serial_println!(
+        "[CELL PMM] allocated KV-Cache block count={} phys=0x{:x} virt=0x{:x}",
+        4,
+        kv_frame.address(),
+        kv_block_virt as usize
+    );
+    serial_println!(
+        "[BSP KV] 16 KiB Paged KV-Cache allocated (4 frames, slot_stride=4096 B, 4 tokens)"
+    );
 
     while !ipc::AP3_DONE.load(Ordering::Acquire) {
         core::hint::spin_loop();

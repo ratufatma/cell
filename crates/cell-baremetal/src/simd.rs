@@ -337,8 +337,16 @@ pub unsafe fn multi_head_attention_512_avx(
             } else {
                 core::ptr::null()
             },
-            core::ptr::null(),
-            core::ptr::null(),
+            if !k_tokens[2].is_null() {
+                k_tokens[2].add(head_offset)
+            } else {
+                core::ptr::null()
+            },
+            if !k_tokens[3].is_null() {
+                k_tokens[3].add(head_offset)
+            } else {
+                core::ptr::null()
+            },
         ];
         let v_h = [
             if !v_tokens[0].is_null() {
@@ -351,8 +359,16 @@ pub unsafe fn multi_head_attention_512_avx(
             } else {
                 core::ptr::null()
             },
-            core::ptr::null(),
-            core::ptr::null(),
+            if !v_tokens[2].is_null() {
+                v_tokens[2].add(head_offset)
+            } else {
+                core::ptr::null()
+            },
+            if !v_tokens[3].is_null() {
+                v_tokens[3].add(head_offset)
+            } else {
+                core::ptr::null()
+            },
         ];
 
         attention_head_64_avx(q_h, k_h, v_h, num_tokens, out_h);

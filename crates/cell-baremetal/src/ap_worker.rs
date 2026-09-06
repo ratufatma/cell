@@ -1,6 +1,6 @@
 use core::sync::atomic::Ordering;
 
-use cell_core::{DType, TensorOp, ValidatorCapability, WorkResult};
+use cell_core::{DType, KvBlockDescriptor, SequenceContext, TensorOp, ValidatorCapability, WorkResult};
 use cell_supervisor::telemetry::{FaultIncident, QueueMetrics, TelemetryEvent, TensorExecution};
 use cell_supervisor::Supervisor;
 use limine::mp::Cpu;
@@ -247,6 +247,96 @@ pub unsafe extern "C" fn ap2_entry(_cpu: &Cpu) -> ! {
                         tb_sum_f32
                     );
 
+                    // --- 4-step autoregressive decode loop (Paged KV-Cache fill) ---
+                    let kv_block = ipc::KV_CACHE_VIRT as *mut u8;
+                    if !kv_block.is_null() {
+                        let mut seq = SequenceContext::<1>::new(
+                            ipc::KV_CACHE_BLOCK_ID.load(Ordering::Acquire) as u64,
+                        );
+                        let _ = seq.append_block(KvBlockDescriptor::new(
+                            0,
+                            ipc::KV_CACHE_PHYS_ADDR.load(Ordering::Acquire),
+                            kv_block,
+                        ));
+                        let wv = ipc::EXTERNAL_WEIGHTS_PTR;
+                        let kv_ptr_table: [(usize, usize); 4] = [
+                            (tensor_init::WT_K0_OFF, tensor_init::WT_V0_OFF),
+                            (tensor_init::WT_K1_OFF, tensor_init::WT_V1_OFF),
+                            (tensor_init::WT_K2_OFF, tensor_init::WT_V2_OFF),
+                            (tensor_init::WT_K3_OFF, tensor_init::WT_V3_OFF),
+                        ];
+                        let mut kv_token_ptrs = [core::ptr::null::<f32>(); 4];
+                        let mut kv_val_ptrs   = [core::ptr::null::<f32>(); 4];
+                        for step in 1..=4usize {
+                            let (k_ptr, v_ptr) = seq
+                                .reserve_next_token_slot()
+                                .expect("KV block capacity exceeded before step 4");
+                            unsafe {
+                                core::ptr::copy_nonoverlapping(
+                                    wv.add(kv_ptr_table[step - 1].0),
+                                    k_ptr,
+                                    512,
+                                );
+                                core::ptr::copy_nonoverlapping(
+                                    wv.add(kv_ptr_table[step - 1].1),
+                                    v_ptr,
+                                    512,
+                                );
+                            }
+                            kv_token_ptrs[step - 1] = k_ptr;
+                            kv_val_ptrs[step - 1] = v_ptr;
+
+                            unsafe { simd::rmsnorm_512_avx(x0_ptr, gamma1_ptr, norm1_ptr, 1e-5) };
+                            unsafe {
+                                let q = core::slice::from_raw_parts_mut(norm1_ptr, 512);
+                                for v in q.iter_mut() { *v *= 0.25; }
+                            }
+                            let mha_sum = unsafe {
+                                simd::multi_head_attention_512_avx(
+                                    norm1_ptr,
+                                    kv_token_ptrs,
+                                    kv_val_ptrs,
+                                    step,
+                                    attn_out_ptr,
+                                )
+                            };
+                            unsafe { simd::vector_add_avx(x0_ptr, attn_out_ptr, x1_ptr, 512) };
+                            unsafe { simd::rmsnorm_512_avx(x1_ptr, gamma2_ptr, norm2_ptr, 1e-5) };
+                            let wffn = ipc::EXTERNAL_WEIGHTS_PTR.add(tensor_init::WT_WFFN_OFF);
+                            unsafe { simd::gemv_512x512_avx(norm2_ptr, wffn, ffn_raw_ptr) };
+                            unsafe { simd::vector_add_avx(ffn_raw_ptr, bias_ptr, ffn_raw_ptr, 512) };
+                            unsafe { simd::relu_avx(ffn_raw_ptr, 512) };
+                            unsafe { simd::vector_add_avx(x1_ptr, ffn_raw_ptr, x2_ptr, 512) };
+
+                            let tb_chunk = unsafe { core::slice::from_raw_parts(x2_ptr, 512) };
+                            let mut tb_dec_sum = 0.0_f64;
+                            for v in tb_chunk { tb_dec_sum += *v as f64; }
+                            let tb_dec_f32 = tb_dec_sum as f32;
+                            let full_tag = if step == 4 { " [BLOCK FULL]" } else { "" };
+                            let exp_tb = match step {
+                                1 => "3072.00",
+                                2 => "3347.40",
+                                3 => "3420.08",
+                                _ => "3332.75",
+                            };
+                            serial_println!(
+                                "[AP2 DECODE] Step {}/4 (N={}) KV-slot={} MHA sum={:.2} TB sum={:.2} expected={}{}",
+                                step, step, step - 1,
+                                mha_sum as f32, tb_dec_f32,
+                                exp_tb, full_tag
+                            );
+                        }
+                        let overflow_slot = seq.reserve_next_token_slot();
+                        if overflow_slot.is_err() {
+                            serial_println!(
+                                "[AP2 KV] capacity boundary: 5th slot rejected, 16 KiB block full"
+                            );
+                        }
+                        ipc::KV_CACHE_DONE.store(true, Ordering::Release);
+                    } else {
+                        serial_println!("[AP2 KV] KV-Cache block unavailable, skipping decode");
+                    }
+
                     let (_context, phys_addr) = task.tensor.deconstruct();
                     ipc::TRANSFORMER_BLOCK_PHYS_ADDR.store(phys_addr, Ordering::Release);
                     ipc::TRANSFORMER_BLOCK_SUM_BITS.store(tb_sum_f32.to_bits() as usize, Ordering::Release);
@@ -406,6 +496,18 @@ pub unsafe extern "C" fn ap3_entry(_cpu: &Cpu) -> ! {
         )
     };
     serial_println!("[CELL PMM] contiguous frames count=5 returned to bitmap");
+
+    while !ipc::KV_CACHE_DONE.load(Ordering::Acquire) {
+        core::hint::spin_loop();
+    }
+    let kv_phys = ipc::KV_CACHE_PHYS_ADDR.load(Ordering::Acquire);
+    unsafe {
+        pmm::free_contiguous_frames(
+            pmm::PhysicalFrame::from_address(kv_phys),
+            4,
+        )
+    };
+    serial_println!("[CELL PMM] KV-Cache 16 KiB block count=4 returned to bitmap");
 
     crate::serial::telemetry(TelemetryEvent::QueueMetrics(QueueMetrics {
         queue_id: 2,

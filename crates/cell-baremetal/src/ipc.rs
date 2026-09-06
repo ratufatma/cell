@@ -42,6 +42,11 @@ pub static EXTERNAL_WEIGHTS_LOADED: AtomicBool = AtomicBool::new(false);
 pub static mut EXTERNAL_WEIGHTS_PTR: *const f32 = core::ptr::null();
 pub static mut EXTERNAL_WEIGHTS_FRAMES: usize = 0;
 
+pub static KV_CACHE_DONE: AtomicBool = AtomicBool::new(false);
+pub static KV_CACHE_PHYS_ADDR: AtomicUsize = AtomicUsize::new(0);
+pub static KV_CACHE_BLOCK_ID: AtomicUsize = AtomicUsize::new(0);
+pub static mut KV_CACHE_VIRT: *mut u8 = core::ptr::null_mut();
+
 const WAIT_TASK_SPIN_LIMIT: usize = 1_000_000;
 
 pub fn wait_task<T>(queue: &'static SpscQueue<T, 8>, queue_name: &'static str) -> Option<T> {

@@ -5,7 +5,8 @@ Generates weights.bin binary for CELL Transformer Block (8-head MHA, d_model=512
 
 Format:
   Header (64 bytes): Magic(8) + Version(2) + Reserved(6) + DataLen(4) + Checksum(4) + Pad(40)
-  Payload (N floats): gamma1(512) + K0(512) + K1(512) + V0(512) + V1(512) + gamma2(512) + bias(512) + W_ffn(512x512)
+  Payload (N floats): gamma1(512) + K0(512) + K1(512) + V0(512) + V1(512) + gamma2(512) + bias(512)
+                      + W_ffn(512x512) + K2(512) + V2(512) + K3(512) + V3(512)
 """
 
 import struct
@@ -21,6 +22,7 @@ NUM_HEADS = 8
 HEAD_DIM = 64
 PARAM_VECTOR = 7 * HIDDEN_DIM
 WFFN_FLOATS = HIDDEN_DIM * HIDDEN_DIM
+KV_TOKEN_FLOATS = 4 * HIDDEN_DIM
 
 
 def generate_weights_bin(output_path: str):
@@ -32,8 +34,12 @@ def generate_weights_bin(output_path: str):
     gamma2 = [1.0] * HIDDEN_DIM
     bias = [-1.0] * HIDDEN_DIM
     w_ffn = [0.0078125] * WFFN_FLOATS
+    k2 = [0.75] * HIDDEN_DIM
+    v2 = [3.0] * HIDDEN_DIM
+    k3 = [0.25] * HIDDEN_DIM
+    v3 = [1.0] * HIDDEN_DIM
 
-    all_floats = gamma1 + k0 + k1 + v0 + v1 + gamma2 + bias + w_ffn
+    all_floats = gamma1 + k0 + k1 + v0 + v1 + gamma2 + bias + w_ffn + k2 + v2 + k3 + v3
     payload_bytes = struct.pack(f"<{len(all_floats)}f", *all_floats)
     payload_len = len(payload_bytes)
     payload_sum = sum(all_floats)

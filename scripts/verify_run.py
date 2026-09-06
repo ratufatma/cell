@@ -89,6 +89,7 @@ def run_verification() -> int:
     rmsnorm_checksum_verified = False
     transformer_block_checksum_verified = False
     external_weights_loaded = False
+    autoregressive_kv_full_verified = False
     pmm_free_count = 0
 
     for line_str in full_output.splitlines():
@@ -132,6 +133,14 @@ def run_verification() -> int:
             and "magic=CELLWGHT verified" in line_str
         ):
             external_weights_loaded = True
+
+        if (
+            "Step 4/4 (N=4) KV-slot=3" in line_str
+            and "[BLOCK FULL]" in line_str
+            and "TB sum=3332.75" in line_str
+            and "expected=3332.75" in line_str
+        ):
+            autoregressive_kv_full_verified = True
 
         if "Trace 4 isolated failure captured" in line_str:
             fault_trace_isolated = True
@@ -230,6 +239,11 @@ def run_verification() -> int:
             "External Weights Module (weights.bin)",
             external_weights_loaded,
             "CELWGHT magic verified via Limine module request",
+        ),
+        (
+            "Autoregressive 4-Step KV-Cache Fill",
+            autoregressive_kv_full_verified,
+            "Incremental token append to 16 KiB block (N=1..4 exact)",
         ),
     ]
 

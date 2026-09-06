@@ -149,7 +149,7 @@ impl<const MAX_BLOCKS: usize> SequenceContext<MAX_BLOCKS> {
         let token_base = unsafe { block.virt_ptr.add(token_idx * BYTES_PER_TOKEN) };
 
         let k_ptr = token_base as *mut f32;
-        let v_ptr = unsafe { token_base.add(NUM_HEADS * HEAD_DIM) } as *mut f32;
+        let v_ptr = unsafe { token_base.add(NUM_HEADS * HEAD_DIM * ELEM_SIZE) } as *mut f32;
 
         block.tokens_written += 1;
         self.total_tokens += 1;

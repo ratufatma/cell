@@ -21,7 +21,11 @@ pub const WT_V1_OFF: usize = 2048;
 pub const WT_GAMMA2_OFF: usize = 2560;
 pub const WT_BIAS_OFF: usize = 3072;
 pub const WT_WFFN_OFF: usize = 3584;
-pub const WT_TOTAL_FLOATS: usize = 3584 + (HIDDEN_DIM * HIDDEN_DIM);
+pub const WT_K2_OFF: usize = WT_WFFN_OFF + (HIDDEN_DIM * HIDDEN_DIM);
+pub const WT_V2_OFF: usize = WT_K2_OFF + HIDDEN_DIM;
+pub const WT_K3_OFF: usize = WT_V2_OFF + HIDDEN_DIM;
+pub const WT_V3_OFF: usize = WT_K3_OFF + HIDDEN_DIM;
+pub const WT_TOTAL_FLOATS: usize = WT_V3_OFF + HIDDEN_DIM;
 
 pub const TENSOR_FRAME_COUNT: usize = 4;
 pub const TB_FRAME_COUNT: usize = 7;
